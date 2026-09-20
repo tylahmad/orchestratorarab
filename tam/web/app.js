@@ -659,10 +659,10 @@ async function loadErrorLog() {
       const head = '[' + t + '] ' + (e.level || 'error') + '/' + (e.source || '')
         + (e.path ? ' ' + e.path : '') + (e.id != null ? ' #' + e.id : '');
       const body = e.message || '';
-      const tb = e.traceback ? ('\\n' + String(e.traceback).split('\\n').slice(-6).join('\\n')) : '';
-      return head + '\\n  ' + body + tb;
+      const tb = e.traceback ? ('\n' + String(e.traceback).split('\n').slice(-6).join('\n')) : '';
+      return head + '\n  ' + body + tb;
     });
-    if (pre) pre.textContent = lines.join('\\n\\n');
+    if (pre) pre.textContent = lines.join('\n\n');
   } catch (e) {
     if (pre) pre.textContent = 'Load failed: ' + e.message + ' (فشل التحميل: ' + e.message + ')';
   }
@@ -1464,9 +1464,48 @@ async function fetchImportStream(url, opts, title) {
     const reader = res.body.getReader();
     const dec = new TextDecoder();
     let buf = '';
+    function consumeImportEvent(ev) {
+      if (ev.event === 'start') {
+        total = ev.total || 1;
+        uiProgress({title: title || 'Importing (جارٍ الاستيراد)', current: 0, total: total, text: 'Start (بدء) 0/' + total});
+      } else if (ev.event === 'item') {
+        total = ev.total || total;
+        if (ev.ok) okN++; else failN++;
+        const lab = (ev.item && (ev.item.label || ev.item.file || ev.item.user_id)) || '';
+        uiProgress({
+          title: title || 'Importing (جارٍ الاستيراد)',
+          current: ev.index || (okN + failN),
+          total: total,
+          text: (ev.ok ? '✓' : '✗') + ' ' + (ev.index || (okN + failN)) + '/' + total
+            + (lab ? ' · ' + lab : '')
+            + ' (succeeded (نجح) ' + okN + ' / Failed (فشل) ' + failN + ')',
+        });
+      } else if (ev.event === 'done') {
+        final = ev;
+        total = ev.total || total;
+        uiProgress({
+          title: title || 'Importing (جارٍ الاستيراد)',
+          current: total,
+          total: total || 1,
+          text: 'complete (اكتمل): succeeded (نجح) ' + (ev.succeeded != null ? ev.succeeded : okN)
+            + ' / Failed (فشل) ' + (ev.failed != null ? ev.failed : failN),
+        });
+      } else if (ev.event === 'error') {
+        throw new Error(ev.error || 'Import failed (فشل الاستيراد)');
+      }
+    }
     while (true) {
       const {value, done} = await reader.read();
-      if (done) break;
+      if (done) {
+        buf += dec.decode();
+        const tail = buf.trim();
+        if (tail) {
+          let ev;
+          try { ev = JSON.parse(tail); } catch (_) { ev = null; }
+          if (ev) consumeImportEvent(ev);
+        }
+        break;
+      }
       buf += dec.decode(value, {stream: true});
       let nl;
       while ((nl = buf.indexOf('\n')) >= 0) {
@@ -1475,34 +1514,7 @@ async function fetchImportStream(url, opts, title) {
         if (!line) continue;
         let ev;
         try { ev = JSON.parse(line); } catch (_) { continue; }
-        if (ev.event === 'start') {
-          total = ev.total || 1;
-          uiProgress({title: title || 'Importing (جارٍ الاستيراد)', current: 0, total: total, text: 'Start (بدء) 0/' + total});
-        } else if (ev.event === 'item') {
-          total = ev.total || total;
-          if (ev.ok) okN++; else failN++;
-          const lab = (ev.item && (ev.item.label || ev.item.file || ev.item.user_id)) || '';
-          uiProgress({
-            title: title || 'Importing (جارٍ الاستيراد)',
-            current: ev.index || (okN + failN),
-            total: total,
-            text: (ev.ok ? '✓' : '✗') + ' ' + (ev.index || (okN + failN)) + '/' + total
-              + (lab ? ' · ' + lab : '')
-              + ' (succeeded (نجح) ' + okN + ' / Failed (فشل) ' + failN + ')',
-          });
-        } else if (ev.event === 'done') {
-          final = ev;
-          total = ev.total || total;
-          uiProgress({
-            title: title || 'Importing (جارٍ الاستيراد)',
-            current: total,
-            total: total || 1,
-            text: 'complete (اكتمل): succeeded (نجح) ' + (ev.succeeded != null ? ev.succeeded : okN)
-              + ' / Failed (فشل) ' + (ev.failed != null ? ev.failed : failN),
-          });
-        } else if (ev.event === 'error') {
-          throw new Error(ev.error || 'Import failed (فشل الاستيراد)');
-        }
+        consumeImportEvent(ev);
       }
     }
     if (!final) final = {event:'done', total: total, succeeded: okN, failed: failN, items: []};
@@ -1595,7 +1607,7 @@ async function loadKick() {
   try {
     kick = await api('/api/autokick');
     syncClock(kick.server_now);
-    if (!kick.enabled) { $('#kickbar').style.display = 'none'; return; }
+    if (!kick.enabled) { $('#kickbar').style.display = 'none'; render(); return; }
     $('#kickbar').style.display = 'flex';
     $('#kickText').textContent =
       'Automatic device cleanup: local takeover for ' + kick.hours + ' hours; kick other devices and verify the cleanup; monitoring ' + kick.watched + ' accounts (التنظيف التلقائي للأجهزة: بعد الاستلام المحلي لمدة ' + kick.hours + ' ساعة؛ طرد الأجهزة الأخرى والتحقق من التنظيف؛ مراقبة ' + kick.watched + ' حسابًا)'
@@ -3750,7 +3762,8 @@ async function ztDownload(url, filename) {
 }
 
 function ztFile(id) {
-  const el = $(id);
+  const selector = String(id || '').startsWith('#') ? String(id) : '#' + String(id || '');
+  const el = $(selector);
   return el && el.files && el.files.length ? el.files : null;
 }
 
@@ -3761,7 +3774,8 @@ function ztConc(id) {
 }
 
 function ztSay(id, html) {
-  const el = $(id);
+  const selector = String(id || '').startsWith('#') ? String(id) : '#' + String(id || '');
+  const el = $(selector);
   if (el) el.innerHTML = html;
 }
 
@@ -4043,7 +4057,7 @@ async function ztConvert() {
     if (/opentele/i.test(msg)) {
       const go = await uiConfirm({
         title: 'Required (مطلوب) opentele',
-        message: msg + '\\n\\nInstall with one click? (هل تثبّت بنقرة واحدة؟) opentele?',
+        message: msg + '\n\nInstall with one click? (هل تثبّت بنقرة واحدة؟) opentele?',
         okText: 'Install now (التثبيت الآن)',
       });
       if (go) {
@@ -4507,7 +4521,8 @@ function collectAiConfigBody() {
     if (el) tools[t.name] = !!el.checked;
     else if (AI_CFG && AI_CFG.tools) tools[t.name] = !!AI_CFG.tools[t.name];
   });
-  const accRaw = ($('#aiAccounts') && $('#aiAccounts').value || '').trim();
+  const accEl = $('#aiAccounts');
+  const accRaw = (accEl && accEl.value || '').trim();
   const allow = accRaw ? accRaw.split(/[,\uFF0C\s]+/).map(function (x) { return parseInt(x, 10); }).filter(function (n) { return n > 0; }) : [];
   const prev = AI_CFG || {};
   const body = {
@@ -4525,7 +4540,7 @@ function collectAiConfigBody() {
     auto_compress: $('#aiAutoCompress') ? !!$('#aiAutoCompress').checked : (prev.auto_compress !== false),
     context_keep_recent: parseInt(($('#aiKeepRecent') && $('#aiKeepRecent').value) || prev.context_keep_recent || '8', 10),
     context_max_chars: parseInt(($('#aiMaxChars') && $('#aiMaxChars').value) || prev.context_max_chars || '14000', 10),
-    allow_account_ids: allow.length ? allow : (prev.allow_account_ids || []),
+    allow_account_ids: accEl ? allow : (prev.allow_account_ids || []),
     require_confirm_destructive: $('#aiReqConfirm') ? !!$('#aiReqConfirm').checked : (prev.require_confirm_destructive !== false),
     confirm_write: $('#aiReqWrite') ? !!$('#aiReqWrite').checked : (prev.confirm_write !== false),
     tools: tools,
@@ -4787,6 +4802,8 @@ function aiAppendBubble(role, text, trace) {
 }
 
 function aiShowTyping() {
+  const existing = $('#aiTyping');
+  if (existing) return existing;
   const box = $('#aiMsgs');
   if (!box) return null;
   const row = document.createElement('div');
@@ -4939,7 +4956,7 @@ function aiChatOnce(approve) {
       let usedStream = false;              // went through the streaming-read path → must retain the live bubble
       function liveBubble() {
         if (liveRow) return liveRow;
-        liveRow = aiShowTyping();           // Reuse the thinking row for streaming text
+        liveRow = $('#aiTyping') || aiShowTyping(); // Reuse the row made by aiSend
         liveRow.classList.add('streaming');
         usedStream = true;
         liveDiv = liveRow.querySelector('.ai-bubble');
@@ -4952,9 +4969,32 @@ function aiChatOnce(approve) {
           if (usedStream) finalEvt = Object.assign({}, finalEvt, {_streamed: true});
           resolve(finalEvt);
         }
+        function consumeEvent(ev) {
+          if (ev.event === 'delta' && typeof ev.text === 'string') {
+            liveBubble();
+            if (liveDiv) liveDiv.textContent = (liveDiv.textContent || '') + ev.text;
+            return false;
+          }
+          if (ev.event === 'done' || ev.event === 'error' || ev.event === 'final') {
+            finalEvt = ev;
+            handle(ev);
+            return true;
+          }
+          return false;
+        }
         function pump() {
           return reader.read().then(function (chunk) {
             if (chunk.done) {
+              // Flush the decoder and parse a final line even when the server closed
+              // the stream without a trailing newline.
+              buf += decoder.decode();
+              const tail = buf.trim();
+              if (tail) {
+                try {
+                  const ev = JSON.parse(tail);
+                  if (consumeEvent(ev)) return;
+                } catch (_) {}
+              }
               // Stream ended; explicit done event was truncated, so use accumulated text as a fallback.
               if (!finalEvt) {
                 const text = (liveDiv ? liveDiv.textContent : '') || '';
@@ -4972,18 +5012,7 @@ function aiChatOnce(approve) {
               if (!line) continue;
               let ev;
               try { ev = JSON.parse(line); } catch (_) { continue; }
-              if (ev.event === 'delta' && typeof ev.text === 'string') {
-                liveBubble();
-                if (liveDiv) liveDiv.textContent = (liveDiv.textContent || '') + ev.text;
-              } else if (ev.event === 'done') {
-                finalEvt = ev;
-                handle(ev);
-                return;
-              } else if (ev.event === 'error' || ev.event === 'final') {
-                finalEvt = ev;
-                handle(ev);
-                return;
-              }
+              if (consumeEvent(ev)) return;
             }
             return pump();
           }, function (err) { reject(err); });
@@ -5013,7 +5042,7 @@ async function aiSend() {
   let approve = null;
   try {
     while (true) {
-      aiShowTyping();
+      const activeTyping = aiShowTyping();
       let r = await aiChatOnce(approve);   // streaming : delta enters in real time  #aiTyping, done after  resolve
       // Replace local context with the complete server context to preserve continuity across stages
       if (r && r.messages && r.messages.length) {
@@ -5034,13 +5063,14 @@ async function aiSend() {
       AI_MSGS.push({role: 'assistant', content: msg});
       AI_MSGS = aiCompressLocalHistory(AI_MSGS);
       aiSaveHistory();
-      const typing = $('#aiTyping');
+      const typing = $('#aiTyping') || activeTyping;
       if (r && r._streamed && typing) {
         // Streaming already rendered in real time: convert the typing bubble to the final bubble and add the trace.
         typing.classList.remove('streaming');
         const b = typing.querySelector('.ai-bubble');
         if (b) { b.classList.add('ai-md'); b.innerHTML = aiRenderMd(msg); }
         aiAppendTrace(typing.querySelector('.ai-bubble') || typing, (r && r.trace) || []);
+        typing.removeAttribute('id');
       } else {
         aiHideTyping();
         aiAppendBubble('bot', msg, (r && r.trace) || []);

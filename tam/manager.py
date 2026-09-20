@@ -533,7 +533,16 @@ class AccountManager:
         self._pending[account_id] = PendingLogin(
             account_id, acc.phone, sent.phone_code_hash, client, time.time()
         )
-        self.db.log(account_id, "send_code", True, acc.phone)
+        try:
+            self.db.log(account_id, "send_code", True, acc.phone)
+        except Exception:
+            self._pending.pop(account_id, None)
+            try:
+                if client.is_connected():
+                    await client.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
         return {"account_id": account_id, "phone": acc.phone, "code_sent": True}
 
     async def sign_in(
@@ -713,7 +722,11 @@ class AccountManager:
             created_at=time.time(),
             png_b64=png_b64,
         )
-        self.db.log(account_id, "qr_login_start", True, f"expires={int(exp_ts)}")
+        try:
+            self.db.log(account_id, "qr_login_start", True, f"expires={int(exp_ts)}")
+        except Exception:
+            await self._cleanup_qr(account_id)
+            raise
         return {
             "ok": True,
             "account_id": account_id,
@@ -826,42 +839,45 @@ class AccountManager:
             raise RuntimeError(f"扫码登录失败：{ename}: {exc}") from exc
 
         client = pend.client
-        if not await client.is_user_authorized():
-            await self._cleanup_qr(account_id)
-            raise RuntimeError("扫码后仍未授权，请重试")
-
-        me = await client.get_me()
-        session_str = client.session.save()
-        phone = None
-        if getattr(me, "phone", None):
-            phone = "+" + str(me.phone).lstrip("+")
-        meta = self._commit_takeover(
-            account_id,
-            session_str,
-            user_id=getattr(me, "id", None),
-            username=getattr(me, "username", None),
-            phone=phone,
-            reset_device=False,
-        )
-        # 标记状态
         try:
-            self.db.update(account_id, status="active", status_note="qr_login")
-        except Exception:  # noqa: BLE001
-            pass
-        self.db.log(
-            account_id, "qr_login", True,
-            f"user_id={getattr(me, 'id', None)}",
-        )
-        await self._cleanup_qr(account_id)
-        return {
-            "ok": True,
-            "account_id": account_id,
-            "user_id": getattr(me, "id", None),
-            "username": getattr(me, "username", None),
-            "phone": phone,
-            "adopted_at": meta.get("adopted_at"),
-            "note": "扫码登录成功，会话已加密入库",
-        }
+            if client is None or not await client.is_user_authorized():
+                raise RuntimeError("扫码后仍未授权，请重试")
+
+            me = await client.get_me()
+            session_str = client.session.save()
+            if not session_str:
+                raise RuntimeError("QR login succeeded but returned an empty session; nothing was saved (نجح تسجيل الدخول عبر QR لكن الجلسة فارغة؛ لم تُحفظ أي بيانات)")
+            phone = None
+            if getattr(me, "phone", None):
+                phone = "+" + str(me.phone).lstrip("+")
+            meta = self._commit_takeover(
+                account_id,
+                session_str,
+                user_id=getattr(me, "id", None),
+                username=getattr(me, "username", None),
+                phone=phone,
+                reset_device=False,
+            )
+            # 标记状态
+            try:
+                self.db.update(account_id, status="active", status_note="qr_login")
+            except Exception:  # noqa: BLE001
+                pass
+            self.db.log(
+                account_id, "qr_login", True,
+                f"user_id={getattr(me, 'id', None)}",
+            )
+            return {
+                "ok": True,
+                "account_id": account_id,
+                "user_id": getattr(me, "id", None),
+                "username": getattr(me, "username", None),
+                "phone": phone,
+                "adopted_at": meta.get("adopted_at"),
+                "note": "扫码登录成功，会话已加密入库",
+            }
+        finally:
+            await self._cleanup_qr(account_id)
 
     async def qr_login_cancel(self, account_id: int) -> dict[str, Any]:
         """取消进行中的扫码登录并断开临时连接。"""
@@ -909,6 +925,13 @@ class AccountManager:
         self.db.log(account_id, "fetch_code", True, f"code_len={len(code)}")
         res = await self.sign_in(account_id, code, password)
         if res.get("need_password"):
+            pending = self._pending.pop(account_id, None)
+            if pending is not None:
+                try:
+                    if pending.client.is_connected():
+                        await pending.client.disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
             raise RuntimeError("该账号开启了两步验证，请带 password 重试")
         return res
 
@@ -923,7 +946,10 @@ class AccountManager:
             if not await client.is_user_authorized():
                 raise RuntimeError("session 无效或已失效")
             me = await client.get_me()
-            self._save_session(acc, client.session.save())
+            session_str = client.session.save()
+            if not session_str:
+                raise RuntimeError("Import succeeded but returned an empty session; nothing was saved (نجح الاستيراد لكن الجلسة فارغة؛ لم تُحفظ أي بيانات)")
+            self._save_session(acc, session_str)
             self.db.update(
                 account_id, user_id=me.id, username=me.username,
                 phone=me.phone, status="active", status_note=None,
@@ -1368,14 +1394,10 @@ class AccountManager:
                 if not new_str:
                     raise RuntimeError("新会话为空，未写入")
 
-                # 旧授权退出：前手拿着旧 session 也进不来
+                # Keep the old authorization alive until the new session is
+                # durably committed.  Otherwise a DB failure here would leave
+                # the account with an old session that Telegram already invalidated.
                 old_logged_out = False
-                try:
-                    await old_client.log_out()
-                    old_logged_out = True
-                except Exception:  # noqa: BLE001
-                    old_logged_out = False
-
                 phone_out = (
                     ("+" + str(new_me.phone).lstrip("+"))
                     if getattr(new_me, "phone", None) else acc.phone
@@ -1393,6 +1415,11 @@ class AccountManager:
                     phone=phone_out,
                     reset_device=True,
                 )
+                try:
+                    await old_client.log_out()
+                    old_logged_out = True
+                except Exception:  # noqa: BLE001
+                    old_logged_out = False
                 self.db.log(
                     account_id, "regenerate_session", True,
                     f"old_logout={old_logged_out} device={device_model} "
@@ -1489,7 +1516,12 @@ class AccountManager:
             if dup is not None:
                 fresh = self.db.get(acc.id)
                 # 合并覆盖 = 本机重新接管该号：重置 adopted_at，避免清设备按旧时间触发
-                if fresh and fresh.session_enc:
+                if fresh is None:
+                    await _emit(i, {"ok": False, "file": f.name,
+                                "label": lbl,
+                                "error": "Import record disappeared before merge; the existing account was not overwritten (اختفى سجل الاستيراد قبل الدمج؛ لم يتم استبدال الحساب الموجود)"})
+                    continue
+                if fresh.session_enc:
                     plain = decrypt(self.s.master_key, fresh.session_enc)
                     self._commit_takeover(
                         dup.id, plain,
@@ -1557,7 +1589,12 @@ class AccountManager:
                         if a.user_id == info["user_id"] and a.id != acc.id), None)
             if dup is not None:
                 fresh = self.db.get(acc.id)
-                if fresh and fresh.session_enc:
+                if fresh is None:
+                    await _emit(i, {"ok": False, "file": f.name,
+                                "label": lbl,
+                                "error": "Import record disappeared before merge; the existing account was not overwritten (اختفى سجل الاستيراد قبل الدمج؛ لم يتم استبدال الحساب الموجود)"})
+                    continue
+                if fresh.session_enc:
                     plain = decrypt(self.s.master_key, fresh.session_enc)
                     self._commit_takeover(
                         dup.id, plain,
@@ -1625,7 +1662,12 @@ class AccountManager:
                         if a.user_id == info["user_id"] and a.id != acc.id), None)
             if dup is not None:
                 fresh = self.db.get(acc.id)
-                if fresh and fresh.session_enc:
+                if fresh is None:
+                    await _emit(i, {"ok": False, "file": f.name,
+                                "label": lbl,
+                                "error": "Import record disappeared before merge; the existing account was not overwritten (اختفى سجل الاستيراد قبل الدمج؛ لم يتم استبدال الحساب الموجود)"})
+                    continue
+                if fresh.session_enc:
                     plain = decrypt(self.s.master_key, fresh.session_enc)
                     self._commit_takeover(
                         dup.id, plain,
@@ -1730,7 +1772,8 @@ class AccountManager:
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(f"注销失败：{type(exc).__name__}: {exc}") from exc
 
-        if purge_local:
+        local_purged = bool(purge_local and remote_ok)
+        if local_purged:
             self.db.update(
                 account_id,
                 session_enc=None,
@@ -1749,10 +1792,11 @@ class AccountManager:
             "ok": remote_ok,
             "account_id": account_id,
             "remote_deleted": remote_ok,
-            "local_purged": bool(purge_local),
+            "local_purged": local_purged,
             "reason": reason,
-            "note": "已向 Telegram 提交注销；本地会话已清除" if purge_local
-                    else "已向 Telegram 提交注销；本地记录未清",
+            "note": "已向 Telegram 提交注销；本地会话已清除" if local_purged
+                    else ("Telegram did not confirm deletion; local data was retained for retry (لم يؤكد Telegram الحذف؛ تم الاحتفاظ بالبيانات المحلية لإعادة المحاولة)"
+                          if purge_local else "已向 Telegram 提交注销；本地记录未清"),
         }
 
     # ---------- 会话上下文 ----------
@@ -1836,7 +1880,13 @@ class AccountManager:
 
     def _mark(self, account_id: int, status: str, exc: Exception, note: str | None = None) -> None:
         acc = self.db.get(account_id)
-        preserve_spam = _has_saved_spam_result(acc) and status != "banned"
+        spam_saved = _has_saved_spam_result(acc)
+        # A live deactivation-ban must override a different SpamBot result,
+        # but it should not erase the reply when the saved result is already
+        # the same banned status.
+        preserve_spam = spam_saved and (
+            status != "banned" or bool(acc and acc.status == "banned")
+        )
         stored_status = acc.status if preserve_spam and acc else status
         stored_note = acc.status_note if preserve_spam and acc else (note or repr(exc)[:500])
         self.db.update(
@@ -1867,6 +1917,8 @@ class AccountManager:
         成员数、最后活跃时间都返回，方便先排序再选。
         """
         items: list[dict[str, Any]] = []
+        if kind not in ("group", "channel", "all"):
+            kind = "all"
         async with self.session(account_id) as client:
             async for d in client.iter_dialogs(limit=limit):
                 is_group = bool(d.is_group)
@@ -2000,7 +2052,9 @@ class AccountManager:
                     peer, files if len(files) > 1 else files[0], caption=body, **kwargs
                 )
                 if isinstance(msg, list):
-                    msg = msg[-1]
+                    msg = msg[-1] if msg else None
+                if msg is None:
+                    raise RuntimeError("Telegram returned no message after sending the attachment (لم يُرجع Telegram رسالة بعد إرسال المرفق)")
             else:
                 msg = await client.send_message(peer, body, **kwargs)
             self.db.log(account_id, "send_message", True,
@@ -2133,7 +2187,10 @@ class AccountManager:
         acc = self.db.get(account_id)
         if acc is None:
             return real
-        old = float(acc.login_at or 0.0)
+        try:
+            old = float(acc.login_at or 0.0)
+        except (TypeError, ValueError):
+            old = 0.0
         if not old or abs(old - real) > 60:
             self.db.update(account_id, login_at=real)
             if old and old - real > 3600:
@@ -2157,7 +2214,8 @@ class AccountManager:
             res = await client(functions.account.GetAuthorizationsRequest())
         except Exception:
             return None
-        cur = next((a for a in res.authorizations if getattr(a, "current", False)), None)
+        cur = next((a for a in (getattr(res, "authorizations", None) or [])
+                    if getattr(a, "current", False)), None)
         real = self._auth_ts(getattr(cur, "date_created", None)) if cur else None
         return self._apply_server_login_at(account_id, real)
 
@@ -2174,7 +2232,9 @@ class AccountManager:
 
         async with self.session(account_id) as client:
             res = await client(functions.account.GetAuthorizationsRequest())
-            cur = next((a for a in res.authorizations if getattr(a, "current", False)), None)
+            auths = list(getattr(res, "authorizations", None) or [])
+            cur = next((a for a in auths
+                    if getattr(a, "current", False)), None)
             real = self._auth_ts(getattr(cur, "date_created", None)) if cur else None
             self._apply_server_login_at(account_id, real)
             return [{
@@ -2187,7 +2247,7 @@ class AccountManager:
                 "current": a.current,
                 "date_created": str(getattr(a, "date_created", "") or ""),
                 "date_active": str(a.date_active),
-            } for a in res.authorizations]
+            } for a in auths]
 
     @staticmethod
     def _others(auths: Any) -> dict[int, str]:
@@ -2230,8 +2290,9 @@ class AccountManager:
         from telethon import functions
 
         async with self.session(account_id) as client:
+            auth_res = await client(functions.account.GetAuthorizationsRequest())
             before = self._others(
-                (await client(functions.account.GetAuthorizationsRequest())).authorizations
+                getattr(auth_res, "authorizations", None) or []
             )
             if not before:
                 self.db.log(account_id, "terminate_sessions", True, "本来就只有本机一个会话")
@@ -2255,8 +2316,9 @@ class AccountManager:
                 return {"ok": True, "verified": None, "before_others": len(before)}
 
             await asyncio.sleep(max(0.0, settle_s))   # 给服务端一点生效时间
+            auth_res = await client(functions.account.GetAuthorizationsRequest())
             after = self._others(
-                (await client(functions.account.GetAuthorizationsRequest())).authorizations
+                getattr(auth_res, "authorizations", None) or []
             )
 
         rep = self._kick_report(before, after)
@@ -2296,9 +2358,9 @@ class AccountManager:
 
         async def worker(idx: int, aid: int) -> None:
             async with sem:
-                if stagger:
-                    await human_delay(self.s.action_min_delay, self.s.action_max_delay)
                 try:
+                    if stagger:
+                        await human_delay(self.s.action_min_delay, self.s.action_max_delay)
                     results[idx] = {"account_id": aid, "ok": True,
                                     "result": await task(aid)}
                 except Exception as exc:
@@ -2379,9 +2441,9 @@ class _SessionCtx:
         try:
             if save and self._acc is not None:
                 try:
-                    if self.client.session.save():
-                        self.mgr._save_session(
-                            self._acc, self.client.session.save())
+                    session_str = self.client.session.save()
+                    if session_str:
+                        self.mgr._save_session(self._acc, session_str)
                 except Exception:  # noqa: BLE001
                     pass
             if self.client.is_connected():

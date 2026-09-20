@@ -15,6 +15,8 @@ session 回写都是它自动做的，不用再抄一遍，也不会出现两处
 from __future__ import annotations
 
 import asyncio
+import math
+import re
 from typing import Any, Awaitable, Callable
 
 __all__ = ["OP_SPECS", "OPS", "get_spec", "validate_params", "run_op",
@@ -37,7 +39,7 @@ async def op_alive(client: Any, p: dict) -> dict:
     """
     from telethon.tl.functions.help import GetAppConfigRequest
 
-    timeout = float(p.get("timeout") or 10)
+    timeout = max(1.0, min(float(p.get("timeout") or 10), 60.0))
     if not await client.is_user_authorized():
         return {"alive": False, "reason": "未授权（session 已失效）"}
     try:
@@ -336,7 +338,7 @@ async def op_contacts_clear(client: Any, p: dict) -> dict:
 async def op_dialogs_clear(client: Any, p: dict) -> dict:
     """清会话列表。默认只退群/频道，不碰私聊——私聊里可能有验证码和找回信息。"""
     keep_private = not p.get("include_private")
-    limit = int(p.get("limit") or 0)
+    limit = max(0, int(p.get("limit") or 0))
 
     left = 0
     kept = 0
@@ -359,7 +361,8 @@ async def op_spam_check(client: Any, p: dict) -> dict:
     """问 @SpamBot 有没有被限制。就是跟机器人发一句 /start 看它怎么回。"""
     bot = await client.get_entity("SpamBot")
     await client.send_message(bot, "/start")
-    await asyncio.sleep(float(p.get("wait") or 3))
+    wait = max(2.0, min(float(p.get("wait") or 3), 20.0))
+    await asyncio.sleep(wait)
     text = ""
     async for m in client.iter_messages(bot, limit=3):
         if getattr(m, "out", False):
@@ -686,16 +689,14 @@ async def op_join_chat(client: Any, p: dict) -> dict:
         entity = await client.get_entity(peer)
         await client(JoinChannelRequest(entity))
     except Exception as exc:  # noqa: BLE001
-        # 有些群用 messages.ImportChatInvite；普通群可能已在对话中
-        try:
-            entity = await client.get_entity(peer)
-            from telethon.tl.functions.messages import ImportChatInviteRequest as _I  # noqa: F401
-            # 尝试 CheckChatInvite 不可加入公开
-            raise ToolboxError(f"加入失败：{type(exc).__name__}: {exc}") from exc
-        except ToolboxError:
-            raise
-        except Exception as exc2:  # noqa: BLE001
-            raise ToolboxError(f"加入失败：{type(exc2).__name__}: {exc2}") from exc2
+        if type(exc).__name__ == "UserAlreadyParticipantError":
+            return {
+                "ok": True, "already_joined": True, "via": "public",
+                "id": getattr(entity, "id", None),
+                "title": getattr(entity, "title", None) or getattr(entity, "first_name", None),
+                "username": getattr(entity, "username", None),
+            }
+        raise ToolboxError(f"Join failed (فشل الانضمام): {type(exc).__name__}: {exc}") from exc
     return {
         "ok": True, "via": "public",
         "id": getattr(entity, "id", None),
@@ -910,6 +911,8 @@ async def op_create_group(client: Any, p: dict) -> dict:
         ))
         chats = list(getattr(res, "chats", []) or [])
         chat = chats[0] if chats else None
+        if chat is None:
+            raise ToolboxError("Telegram returned no new supergroup (لم يُرجع Telegram مجموعة فائقة جديدة)")
         invited = []
         if chat and user_list:
             from telethon.tl.functions.channels import InviteToChannelRequest
@@ -946,6 +949,8 @@ async def op_create_group(client: Any, p: dict) -> dict:
     res = await client(CreateChatRequest(users=entities, title=title))
     chats = list(getattr(res, "chats", []) or [])
     chat = chats[0] if chats else None
+    if chat is None:
+        raise ToolboxError("Telegram returned no new basic group (لم يُرجع Telegram مجموعة أساسية جديدة)")
     return {
         "ok": True, "megagroup": False,
         "id": getattr(chat, "id", None),
@@ -964,8 +969,11 @@ async def op_leave_chat(client: Any, p: dict) -> dict:
     try:
         await client(LeaveChannelRequest(entity))
         return {"ok": True, "left": True, "via": "LeaveChannel", "id": getattr(entity, "id", None)}
-    except Exception:
-        # 普通群：删对话
+    except Exception as exc:
+        # Basic groups use a dialog deletion to leave; do not apply that
+        # destructive fallback to channels or private users after a network error.
+        if type(entity).__name__ != "Chat":
+            raise ToolboxError(f"Leave failed (فشل المغادرة): {type(exc).__name__}: {exc}") from exc
         await client.delete_dialog(entity)
         return {"ok": True, "left": True, "via": "delete_dialog", "id": getattr(entity, "id", None)}
 
@@ -1007,7 +1015,7 @@ async def op_add_contact(client: Any, p: dict) -> dict:
     phone = (p.get("phone") or "").strip()
 
     # 纯手机号导入
-    if target.replace("+", "").isdigit() or (target.startswith("+") and target[1:].isdigit()):
+    if re.fullmatch(r"\+?\d+", target):
         phone = target if target.startswith("+") else f"+{target}"
         res = await client(ImportContactsRequest(contacts=[
             InputPhoneContact(client_id=0, phone=phone, first_name=first, last_name=last)
@@ -1076,7 +1084,9 @@ async def op_send_media(client: Any, p: dict) -> dict:
     entity = await client.get_entity(_resolve_entity(client, target))
     msg = await client.send_file(entity, str(fp), caption=caption or None)
     if isinstance(msg, list):
-        msg = msg[-1]
+        msg = msg[-1] if msg else None
+    if msg is None:
+        raise ToolboxError("Telegram returned no message after sending media (لم يُرجع Telegram رسالة بعد إرسال الوسائط)")
     return {
         "ok": True,
         "message_id": getattr(msg, "id", None),
@@ -1130,6 +1140,8 @@ async def op_create_channel(client: Any, p: dict) -> dict:
     ))
     chats = list(getattr(result, "chats", []) or [])
     ch = chats[0] if chats else None
+    if ch is None:
+        raise ToolboxError("Telegram returned no new channel (لم يُرجع Telegram قناة جديدة)")
     username = str(p.get("username") or "").strip().lstrip("@")
     out = {
         "ok": True,
@@ -1168,8 +1180,8 @@ async def op_interact_bot(client: Any, p: dict) -> dict:
 
     bot = str(p.get("bot") or p.get("target") or "").strip()
     text = str(p.get("text") or "/start").strip()
-    wait = float(p.get("wait") or 5)
-    limit = int(p.get("limit") or 3)
+    wait = max(1.0, min(float(p.get("wait") or 5), 120.0))
+    limit = max(1, min(int(p.get("limit") or 3), 20))
     if not bot:
         raise ToolboxError("需要 bot（@Bot 用户名）")
     entity = await client.get_entity(_resolve_entity(client, bot))
@@ -1452,8 +1464,12 @@ def validate_params(op: str, params: dict | None) -> dict:
         try:
             if kind == "int":
                 out[name] = int(v)
+                if not math.isfinite(float(out[name])):
+                    raise ValueError
             elif kind == "float":
                 out[name] = float(v)
+                if not math.isfinite(out[name]):
+                    raise ValueError
             elif kind == "bool":
                 out[name] = str(v).strip().lower() in ("1", "true", "yes",
                                                        "on") if not isinstance(v, bool) else v
@@ -1484,8 +1500,12 @@ async def run_op(manager: Any, account_id: int, op: str,
     if op in ("logout", "delete_tg_account"):
         try:
             remote_ok = (
-                op == "logout"
-                or (
+                (
+                    isinstance(result, dict)
+                    and result.get("logged_out") is not False
+                )
+                if op == "logout"
+                else (
                     isinstance(result, dict)
                     and result.get("remote_deleted") is True
                 )
@@ -1575,6 +1595,10 @@ async def run_op_batch(manager: Any, account_ids: list[int], op: str,
         if not isinstance(result, dict):
             return True
         if result.get("ok", True) is False:
+            return False
+        if result.get("failed"):
+            return False
+        if result.get("errors"):
             return False
         return (
             result.get("logged_out", True) is not False

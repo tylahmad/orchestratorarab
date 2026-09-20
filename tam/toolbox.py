@@ -361,8 +361,12 @@ async def op_spam_check(client: Any, p: dict) -> dict:
     await client.send_message(bot, "/start")
     await asyncio.sleep(float(p.get("wait") or 3))
     text = ""
-    async for m in client.iter_messages(bot, limit=1):
-        text = m.message or ""
+    async for m in client.iter_messages(bot, limit=3):
+        if getattr(m, "out", False):
+            continue
+        text = getattr(m, "message", None) or ""
+        if text.strip():
+            break
     from .manager import detect_spam_status
 
     spam_status = detect_spam_status(text)
@@ -581,7 +585,7 @@ async def op_unblock_users(client: Any, p: dict) -> dict:
     }
 
 
-def _parse_peer_list(raw: Any) -> list[str]:
+def _parse_peer_list(raw: Any) -> list[str | int]:
     if raw is None:
         return []
     if isinstance(raw, list):
@@ -589,7 +593,7 @@ def _parse_peer_list(raw: Any) -> list[str]:
     else:
         text = str(raw).replace(",", "\n").replace(";", "\n")
         items = [x.strip() for x in text.splitlines()]
-    out: list[Any] = []
+    out: list[str | int] = []
     for x in items:
         if not x:
             continue
@@ -1474,27 +1478,38 @@ async def run_op(manager: Any, account_id: int, op: str,
         if not await client.is_user_authorized():
             raise ToolboxError("这个号没有登录态（session 已失效）")
         result = await fn(client, clean)
-    # 退出登录 / 注销账号后清掉本地 session，避免列表仍显示「已授权」
+    # 退出登录 / 注销账号后清掉本地 session，避免列表仍显示「已授权」。
+    # Telegram 可能返回 remote_deleted=False；这种情况下不要把本地记录
+    # 伪装成已删除，留给用户重试或人工处理。
     if op in ("logout", "delete_tg_account"):
         try:
-            status = "deleted" if op == "delete_tg_account" else "unauthorized"
-            note = (
-                "telegram account deletion requested"
-                if op == "delete_tg_account"
-                else "logged out"
+            remote_ok = (
+                op == "logout"
+                or (
+                    isinstance(result, dict)
+                    and result.get("remote_deleted") is True
+                )
             )
-            manager.db.update(
-                account_id,
-                session_enc=None,
-                status=status,
-                status_note=note,
-                login_at=None,
-                adopted_at=None,
-                last_kick_at=None,
-                kick_retry_at=None,
-            )
+            if remote_ok:
+                status = "deleted" if op == "delete_tg_account" else "unauthorized"
+                note = (
+                    "telegram account deletion requested"
+                    if op == "delete_tg_account"
+                    else "logged out"
+                )
+                manager.db.update(
+                    account_id,
+                    session_enc=None,
+                    status=status,
+                    status_note=note,
+                    spam_until=None,
+                    login_at=None,
+                    adopted_at=None,
+                    last_kick_at=None,
+                    kick_retry_at=None,
+                )
             manager.db.log(
-                account_id, op, True,
+                account_id, op, remote_ok,
                 (result or {}).get("note") if isinstance(result, dict) else "",
             )
         except Exception:
@@ -1549,6 +1564,23 @@ async def run_op_batch(manager: Any, account_ids: list[int], op: str,
 
     results = await manager.run_batch(account_ids, task,
                                       concurrency=concurrency)
-    ok = sum(1 for r in results if r.get("ok"))
+
+    def _completed_ok(row: dict[str, Any]) -> bool:
+        if not row.get("ok"):
+            return False
+        result = row.get("result")
+        # A transport-level success can still contain an explicit operation
+        # failure, such as a failed session-termination verification or a
+        # failed remote logout/deletion request.
+        if not isinstance(result, dict):
+            return True
+        if result.get("ok", True) is False:
+            return False
+        return (
+            result.get("logged_out", True) is not False
+            and result.get("remote_deleted", True) is not False
+        )
+
+    ok = sum(1 for r in results if _completed_ok(r))
     return {"op": op, "total": len(results), "ok": ok,
             "failed": len(results) - ok, "results": results}

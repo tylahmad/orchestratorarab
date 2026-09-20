@@ -353,6 +353,7 @@ class PendingLogin:
     phone_code_hash: str
     client: Any
     created_at: float
+    password_needed: bool = False
 
 
 @dataclass
@@ -461,6 +462,7 @@ class AccountManager:
             "session_enc": encrypt(self.s.master_key, session_str),
             "status": "active",
             "status_note": None,
+            "spam_until": None,
             "adopted_at": now,
             "login_at": now,
             "last_kick_at": None,
@@ -509,9 +511,25 @@ class AccountManager:
         acc = self.db.get(account_id)
         if acc is None or not acc.phone:
             raise RuntimeError("账号不存在或未填写手机号")
+        old = self._pending.pop(account_id, None)
+        if old is not None:
+            try:
+                if old.client.is_connected():
+                    await old.client.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+
         client = self._build_client(acc)
-        await client.connect()
-        sent = await client.send_code_request(acc.phone)
+        try:
+            await client.connect()
+            sent = await client.send_code_request(acc.phone)
+        except Exception:
+            try:
+                if client.is_connected():
+                    await client.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
         self._pending[account_id] = PendingLogin(
             account_id, acc.phone, sent.phone_code_hash, client, time.time()
         )
@@ -527,21 +545,43 @@ class AccountManager:
         if pending is None:
             raise RuntimeError("没有待完成的登录，请先发送验证码")
         acc = self.db.get(account_id)
-        client = pending.client
-        try:
+        if acc is None:
+            self._pending.pop(account_id, None)
             try:
-                await client.sign_in(
-                    phone=pending.phone,
-                    code=code,
-                    phone_code_hash=pending.phone_code_hash,
-                )
-            except SessionPasswordNeededError:
+                if pending.client.is_connected():
+                    await pending.client.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            raise RuntimeError("账号不存在")
+        client = pending.client
+        keep_pending = False
+        try:
+            if pending.password_needed:
                 if not password:
+                    keep_pending = True
                     return {"need_password": True}
                 await client.sign_in(password=password)
+            else:
+                try:
+                    await client.sign_in(
+                        phone=pending.phone,
+                        code=code,
+                        phone_code_hash=pending.phone_code_hash,
+                    )
+                except SessionPasswordNeededError:
+                    if not password:
+                        pending.password_needed = True
+                        # Keep the connected client and pending phone-code state
+                        # so the follow-up request can submit the 2FA password.
+                        keep_pending = True
+                        return {"need_password": True}
+                    await client.sign_in(password=password)
 
             me = await client.get_me()
-            self._save_session(acc, client.session.save())
+            session_str = client.session.save()
+            if not session_str:
+                raise RuntimeError("登录成功但会话为空，未写入数据库")
+            self._save_session(acc, session_str)
             self.db.update(
                 account_id,
                 user_id=me.id,
@@ -549,6 +589,7 @@ class AccountManager:
                 phone=me.phone or acc.phone,
                 status="active",
                 status_note=None,
+                spam_until=None,
                 last_check_at=time.time(),
             )
             self.db.log(account_id, "sign_in", True, f"user_id={me.id}")
@@ -557,8 +598,13 @@ class AccountManager:
             self.db.log(account_id, "sign_in", False, repr(exc))
             raise
         finally:
-            self._pending.pop(account_id, None)
-            await client.disconnect()
+            if not keep_pending:
+                self._pending.pop(account_id, None)
+                try:
+                    if client.is_connected():
+                        await client.disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
 
 
     # ---------- 扫码登录（官方 App 扫码，无需本机收短信）----------
@@ -850,11 +896,15 @@ class AccountManager:
         try:
             code = await wait_for_code(acc.code_url, exclude=baseline,
                                        timeout=timeout, proxy=proxy)
-        except TimeoutError as exc:
+        except Exception as exc:
             self.db.log(account_id, "auto_login", False, str(exc))
             pending = self._pending.pop(account_id, None)
             if pending is not None:
-                await pending.client.disconnect()
+                try:
+                    if pending.client.is_connected():
+                        await pending.client.disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
             raise
         self.db.log(account_id, "fetch_code", True, f"code_len={len(code)}")
         res = await self.sign_in(account_id, code, password)
@@ -865,6 +915,8 @@ class AccountManager:
     async def import_session(self, account_id: int, session_str: str) -> dict[str, Any]:
         """导入已有 StringSession（从其他工具迁入）并验证可用性。"""
         acc = self.db.get(account_id)
+        if acc is None:
+            raise RuntimeError("账号不存在")
         client = self._build_client(acc, session_str)
         try:
             await client.connect()
@@ -874,12 +926,17 @@ class AccountManager:
             self._save_session(acc, client.session.save())
             self.db.update(
                 account_id, user_id=me.id, username=me.username,
-                phone=me.phone, status="active", last_check_at=time.time(),
+                phone=me.phone, status="active", status_note=None,
+                spam_until=None, last_check_at=time.time(),
             )
             self.db.log(account_id, "import_session", True, f"user_id={me.id}")
             return {"ok": True, "user_id": me.id, "username": me.username}
         finally:
-            await client.disconnect()
+            try:
+                if client.is_connected():
+                    await client.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
 
     @staticmethod
     def session_file_to_string(path: str) -> str:
@@ -1605,6 +1662,7 @@ class AccountManager:
                 note = f"local_after_error:{type(exc).__name__}"
                 self.db.log(account_id, "logout", False, repr(exc)[:400])
         self.db.update(account_id, session_enc=None, status="unauthorized",
+                       status_note=None, spam_until=None,
                        login_at=None, adopted_at=None, last_kick_at=None,
                        kick_retry_at=None)
         self.db.log(account_id, "logout", True, note)
@@ -1722,7 +1780,8 @@ class AccountManager:
                     "status": acc.status,
                     "health_status": "unauthorized",
                 }
-            self.db.update(account_id, status="unauthorized", last_check_at=time.time())
+            self.db.update(account_id, status="unauthorized", status_note=None,
+                           spam_until=None, last_check_at=time.time())
             return {"account_id": account_id, "status": "unauthorized",
                     "health_status": "unauthorized"}
         try:
@@ -1854,10 +1913,12 @@ class AccountManager:
             await client.send_message("SpamBot", "/start")
             await asyncio.sleep(4)
             async for m in client.iter_messages("SpamBot", limit=3):
-                if m.out:
+                if getattr(m, "out", False):
                     continue
-                reply = (m.message or "").strip()
-                break
+                candidate = (getattr(m, "message", None) or "").strip()
+                if candidate:
+                    reply = candidate
+                    break
 
         status = detect_spam_status(reply)
         until = time.time() + 24 * 3600 if status == "spam_block" else None
@@ -2288,11 +2349,19 @@ class _SessionCtx:
                 ) from exc
             if not ok:
                 try:
-                    self.mgr.db.update(
-                        self.account_id, status="unauthorized",
-                        status_note="session unauthorized",
-                        last_check_at=time.time(),
-                    )
+                    current = self.mgr.db.get(self.account_id)
+                    if _has_saved_spam_result(current):
+                        # Keep a previously persisted SpamBot result separate
+                        # from the failed live-session health check.
+                        self.mgr.db.update(
+                            self.account_id, last_check_at=time.time()
+                        )
+                    else:
+                        self.mgr.db.update(
+                            self.account_id, status="unauthorized",
+                            status_note="session unauthorized", spam_until=None,
+                            last_check_at=time.time(),
+                        )
                 except Exception:  # noqa: BLE001
                     pass
                 raise RuntimeError("会话未授权或已失效，请重新登录/导入")

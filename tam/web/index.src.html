@@ -237,7 +237,7 @@
       }
       toast(msg);
       loadSettings();
-    } catch (e) { toast('Save failed: ' + e.message + ' (فشل الحفظ: ' + e.message + ')); }
+    } catch (e) { toast('Save failed: ' + e.message + ' (فشل الحفظ: ' + e.message + ')'); }
   }
 
   async function resetSettings() {
@@ -249,7 +249,7 @@
         + (r.restart_required && r.restart_required.length
            ? `${r.restart_required.length} require a restart. (يتطلب ${r.restart_required.length} إعادة تشغيل.)` : ''));
       loadSettings();
-    } catch (e) { toast('Restore failed: ' + e.message + ' (فشل الاستعادة: ' + e.message + ')); }
+    } catch (e) { toast('Restore failed: ' + e.message + ' (فشل الاستعادة: ' + e.message + ')'); }
   }
   </script>
   </div>

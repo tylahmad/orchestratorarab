@@ -1,0 +1,709 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Telegram Account Orchestrator (TAO) — مدير حسابات تيليجرام</title>
+<meta name="description" content="Self-hosted Telegram multi-account management with Web UI, CLI, Bot, MCP, Telethon, and tdata import." />
+<meta property="og:title" content="Telegram Account Orchestrator (TAO)" />
+<meta property="og:description" content="Self-hosted Telegram account manager and orchestration toolkit." />
+<style>
+  /* CSS_PLACEHOLDER */
+</style>
+</head>
+<body>
+<header>
+  <h1>✈️ Telegram Account Manager (مدير الحسابات) <span class="pill" id="mode">Full Access (صلاحيات كاملة)</span></h1>
+  <span class="sp"></span>
+  <input id="token" placeholder="Access token (leave empty for tokenless mode) (رمز الوصول (اتركه فارغًا للوضع بلا رمز))" style="max-width:230px" />
+  <label class="row muted fit" style="gap:4px"><input type="checkbox" id="auto" style="width:16px;min-height:0" /> Auto-refresh (تحديث تلقائي)</label>
+  <button class="fit" onclick="runDoctor()" title="Check environment, dependencies, secrets, database, and tdata in one click; fix what can be fixed (افحص البيئة والتبعيات والأسرار وقاعدة البيانات وtdata بنقرة واحدة؛ أصلح ما يمكن إصلاحه)">Health Check (فحص الحالة)</button>
+  <button class="fit write" onclick="hotReload()" title="Actually restart the backend process (hot reload); active tasks will be interrupted (أعد تشغيل عملية الخادم فعليًا؛ ستتوقف المهام النشطة)">Hot Reload (إعادة التحميل السريع)</button>
+  <button class="fit" onclick="openAiPanel()" title="AI chat and permission settings (محادثة الذكاء الاصطناعي وإعدادات الصلاحيات)">AI Assistant (مساعد الذكاء الاصطناعي)</button>
+  <button class="fit" onclick="openErrorLog()" title="Server and frontend error logs; export for reporting (سجلات أخطاء الخادم والواجهة؛ صدّرها لإعداد تقرير)">Error Log (سجل الأخطاء)</button>
+  <button class="fit" id="editBtn" onclick="toggleEdit()" title="Drag to move, drag edges to resize, click the top-right × to hide (اسحب للنقل، واسحب الحواف لتغيير الحجم، وانقر × أعلى اليمين للإخفاء)">Edit Layout (تحرير التخطيط)</button>
+  <button class="fit" onclick="openHelp()" title="Feature guide and user documentation (دليل الميزات ووثائق المستخدم)">Help (مساعدة)</button>
+  <button class="fit" onclick="refresh()">Refresh (تحديث)</button>
+</header>
+<div class="demo" id="demoBar">Demo mode: sample data is shown and no backend is connected. Start <code>python -m tam.cli serve</code>, then open http://127.0.0.1:8848 for real data. (الوضع التجريبي: المعروض بيانات نموذجية ولا يوجد اتصال بالخادم. شغّل python -m tam.cli serve ثم افتح http://127.0.0.1:8848 للبيانات الحقيقية.)</div>
+<div class="bar"><i id="prog"></i></div>
+
+<main>
+  <div class="board" id="board">
+  <div class="ph" id="ph"></div>
+
+  <div class="card kickbar" id="kickbar" data-widget="kickbar" style="display:none">
+    <span id="kickText" class="muted">—</span>
+    <span class="sp" style="flex:1"></span>
+    <label class="row" style="gap:6px;margin:0" title="Retry delay after a kick fails or verification does not pass. Format: 45s / 10m / 2h / 1h30m (مهلة إعادة المحاولة بعد فشل الطرد أو عدم اجتياز التحقق. الصيغة: 45s / 10m / 2h / 1h30m)">
+      <span class="muted" style="white-space:nowrap">Retry on failure (إعادة المحاولة عند الفشل)</span>
+      <input id="kickRetry" style="width:96px;min-height:0;padding:4px 8px" placeholder="1h" />
+    </label>
+    <button class="fit write" onclick="saveKickRetry()" title="Save retry interval (leave empty for default) (احفظ فترة إعادة المحاولة؛ اتركها فارغة لاستخدام الافتراضي)">Save (حفظ)</button>
+    <button class="fit write" onclick="kickNow()" title="Immediately clear other devices for due accounts without waiting for the backend timer (امسح الأجهزة الأخرى للحسابات المستحقة فورًا دون انتظار مؤقت الخادم)">Run Now (تنفيذ الآن)</button>
+  </div>
+
+  <div class="card" data-widget="accounts">
+    <div class="toolbar">
+      <input id="q" placeholder="Search alias / phone / username / tags (ابحث بالاسم المستعار / الهاتف / اسم المستخدم / الوسوم)" style="max-width:260px" oninput="render()" />
+      <span class="row fit" id="chips"></span>
+      <span class="row fit quick-filters" id="qfilters"></span>
+      <span class="sp" style="flex:1"></span>
+      <button class="fit" onclick="openModal('mAdd')">Add Account (إضافة حساب)</button>
+      <button class="fit" onclick="openModal('mImport')">Bulk Import (استيراد جماعي)</button>
+      <button class="fit" onclick="openModal('mSession')">Import session (استيراد session)</button>
+      <button class="fit" onclick="openModal('mTdata')">Import tdata (استيراد tdata)</button>
+    </div>
+    <div class="bulk" id="bulk">
+      <b id="selN">Selected: 0 (المحدد: 0)</b>
+      <button class="sm" onclick="bulk('check')">Health Check (فحص الحالة)</button>
+      <button class="sm write" onclick="bulk('auto')">Auto Login (تسجيل الدخول تلقائيًا)</button>
+      <button class="sm write" onclick="openModal('mSend')">Send Message (إرسال رسالة)</button>
+      <button class="sm write" onclick="bulkWarmup()">Warm Up (تهيئة الحساب)</button>
+      <button class="sm" onclick="proxyAudit()">Proxy Check (فحص الوكيل)</button>
+      <button class="sm write" onclick="bulkOkpay()">OKPay Balance (رصيد OKPay)</button>
+      <button class="sm write" onclick="bulkTerminate()">Kick Devices (طرد الأجهزة)</button>
+      <button class="sm write" onclick="bulkTag()">Tag (وضع وسم)</button>
+      <button class="sm write" onclick="bulkExport('pack')">Export Pack (تصدير حزمة)</button>
+      <button class="sm write" onclick="bulkExport('session')">Export .session (تصدير .session)</button>
+      <button class="sm danger write" onclick="bulkRegen()">Regenerate Session (إعادة إنشاء الجلسة)</button>
+      <button class="sm danger write" onclick="bulkDelete()">Delete Locally (حذف محليًا)</button>
+      <button class="sm danger write" onclick="bulkDeleteTelegram()">Delete Telegram Account (حذف حساب تيليجرام)</button>
+      <span class="sp" style="flex:1"></span>
+      <button class="sm" onclick="clearSel()">Clear Selection (إلغاء التحديد)</button>
+</div>
+    <div class="scroll">
+      <table>
+        <thead><tr>
+          <th style="width:36px"><input type="checkbox" id="all" style="width:16px;min-height:0" onclick="toggleAll(this.checked)" /></th>
+          <th>Alias (الاسم المستعار)</th><th>Phone (الهاتف)</th><th class="hide-s">Country/Region (الدولة/المنطقة)</th><th class="hide-s">Username (اسم المستخدم)</th><th>Status (الحالة)</th>
+          <th class="hide-s" title="Two-step verification password; masked by default, click the eye to view (كلمة مرور التحقق بخطوتين؛ تكون مخفية افتراضيًا، انقر العين لعرضها)">2FA (التحقق بخطوتين)</th>
+          <th class="hide-s">Proxy (الوكيل)</th><th class="hide-s">Code Source (مصدر الرمز)</th><th class="hide-s">Tags (الوسوم)</th>
+          <th class="hide-s" title="Automatically kick other devices after the configured login duration (اطرد الأجهزة الأخرى تلقائيًا بعد مدة تسجيل الدخول المحددة)">Clear Devices (مسح الأجهزة)</th><th>Actions (الإجراءات)</th>
+        </tr></thead>
+        <tbody id="tb"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card pane" data-widget="logText">
+    <h3>Activity Log · Human-readable Summary (سجل العمليات · ملخص قابل للقراءة) <span class="muted" id="logHint">Latest 20 (أحدث 20)</span>
+      <span class="sp" style="flex:1"></span>
+      <span class="muted" id="logPin" style="display:none;font-size:12px">Action result locked (نتيجة العملية مقفلة)</span>
+      <button class="sm fit" onclick="unpinLog()">Resume automatic log (استئناف السجل التلقائي)</button></h3>
+    <pre id="log">—</pre>
+  </div>
+
+  <div class="card pane" data-widget="tasks">
+    <h3>Task Center (مركز المهام) <span class="muted" id="taskHint">No tasks yet (لا توجد مهام بعد)</span>
+      <span class="sp" style="flex:1"></span>
+      <button class="sm fit write" onclick="newCollectTask()" title="Collect group speakers by recent activity (اجمع المتحدثين في المجموعات حسب النشاط الأخير)">Collect Speakers (جمع المتحدثين)</button>
+      <button class="sm fit write" onclick="newMessageTask()" title="Supports rich text and clickable hyperlinks (يدعم النص المنسق والروابط القابلة للنقر)">New Broadcast (إنشاء إرسال جماعي)</button>
+      <button class="sm fit" onclick="loadTasks(true)">Refresh (تحديث)</button></h3>
+    <div class="scroll" id="taskList"><span class="muted">No tasks yet. Collect speakers first, then broadcast to the collected results. (لا توجد مهام بعد. اجمع المتحدثين أولًا ثم أرسل جماعيًا إلى النتائج.)</span></div>
+  </div>
+
+  <div class="card pane" data-widget="leads">
+    <h3>Lead Library (مكتبة العملاء المحتملين) <span class="muted" id="leadHint"></span>
+      <span class="sp" style="flex:1"></span>
+      <button class="sm fit" onclick="exportLeads()">Export CSV (تصدير CSV)</button>
+      <button class="sm fit" onclick="loadLeads()">Refresh (تحديث)</button></h3>
+    <div class="scroll" id="leadList"><span class="muted">No leads have been collected yet. (لم يتم جمع أي عملاء محتملين بعد.)</span></div>
+  </div>
+
+  <div class="card pane" data-widget="logJson">
+    <h3>Activity Log · Raw Data (JSON) (سجل العمليات · البيانات الخام (JSON))</h3>
+    <pre id="logRaw">—</pre>
+  </div>
+
+  <div class="card pane" data-widget="settings">
+    <h3>Settings Panel (لوحة الإعدادات) <span class="muted" id="setHint"></span>
+      <span class="sp" style="flex:1"></span>
+      <button class="sm fit write" onclick="saveSettings()" title="Submit changed items only (أرسل العناصر التي تغيرت فقط)">Save Changes (حفظ التغييرات)</button>
+      <button class="sm fit write" onclick="resetSettings()" title="Restore all settings to defaults (secrets unchanged) (استعد كل الإعدادات إلى الافتراضيات؛ لا تتغير الأسرار)">Restore Defaults (استعادة الإعدادات الافتراضية)</button>
+      <button class="sm fit" onclick="loadSettings()">Refresh (تحديث)</button></h3>
+    <div class="scroll" id="setBody"><span class="muted">Loading… (جارٍ التحميل…)</span></div>
+  </div>
+
+  <div class="card pane" data-widget="toolbox">
+    <h3>Toolbox (صندوق الأدوات) <span class="muted" id="tbHint">Acts directly on selected accounts in the library (يعمل مباشرة على الحسابات المحددة في المكتبة)</span>
+      <span class="sp" style="flex:1"></span>
+      <button class="sm fit" onclick="loadOps()">Refresh (تحديث)</button></h3>
+    <div class="scroll" id="tbBody"><span class="muted">Loading… (جارٍ التحميل…)</span></div>
+  </div>
+
+  <div class="card pane" data-widget="ziptools">
+    <h3>ZIP Tools (أدوات ZIP) <span class="muted">Split / merge packs / registration time / convert to API (تقسيم / دمج الحزم / وقت التسجيل / التحويل إلى API)</span>
+      <span class="sp" style="flex:1"></span>
+      <button class="sm fit" onclick="renderZt()">Refresh (تحديث)</button></h3>
+    <div class="scroll" id="ztBody"><span class="muted">Loading… (جارٍ التحميل…)</span></div>
+  </div>
+
+  <script>
+  // Settings panel. Fields come from /api/settings; new backend parameters need no frontend changes.
+  let SET_ORIG = {};   // Original values, used to find actual changes
+  let SET_SPECS = {};  // key -> spec
+
+  function setInputId(k) { return 'set_' + k; }
+
+  function setFieldHtml(f) {
+    const id = setInputId(f.key);
+    const tip = esc(f.desc || '');
+    const warn = f.restart_required
+      ? ' <span class="muted" title="Read at startup; restart after changing it for the change to take effect (تُقرأ عند بدء التشغيل؛ أعد التشغيل بعد تغييرها لتفعيل التغيير)">↺</span>' : '';
+    let input;
+    if (f.type === 'bool') {
+      const on = String(f.value) === '1' ? ' checked' : '';
+      input = `<input type="checkbox" id="${id}" style="width:16px;min-height:0"${on} />`;
+    } else if (f.type.indexOf('choice:') === 0) {
+      const opts = f.type.split(':')[1].split(',').map(o =>
+        `<option value="${esc(o)}"${o === f.value ? ' selected' : ''}>${esc(o)}</option>`).join('');
+      input = `<select id="${id}" style="min-height:0;padding:4px 8px">${opts}</select>`;
+    } else {
+      const num = (f.type === 'int' || f.type === 'float') ? ' inputmode="decimal"' : '';
+      input = `<input id="${id}" value="${esc(f.value)}" placeholder="${esc(f.default)}"`
+            + `${num} style="min-height:0;padding:4px 8px;max-width:230px" />`;
+    }
+    return `<div class="row" style="gap:8px;align-items:center;padding:4px 0">
+      <code style="min-width:210px;font-size:12px">${esc(f.key)}${warn}</code>
+      ${input}
+      <span class="muted" style="font-size:12px;flex:1">${tip}</span>
+    </div>`;
+  }
+
+  async function loadSettings() {
+    const box = $('#setBody');
+    try {
+      const d = await api('/api/settings');
+      SET_ORIG = {}; SET_SPECS = {};
+      let html = '';
+      for (const [group, fields] of Object.entries(d.groups || {})) {
+        html += `<h4 style="margin:12px 0 2px;font-size:13px">${esc(group)}</h4>`;
+        for (const f of fields) {
+          SET_ORIG[f.key] = String(f.value);
+          SET_SPECS[f.key] = f;
+          html += setFieldHtml(f);
+        }
+      }
+      if (d.secrets && d.secrets.length) {
+        html += `<h4 style="margin:12px 0 2px;font-size:13px">Secrets (الأسرار)</h4>`
+              + `<div class="muted" style="font-size:12px;margin-bottom:4px">`
+              + `For security, plaintext is never shown. Empty means unchanged; a value overwrites it. (لأسباب أمنية لا يُعرض النص الصريح. الفراغ يعني بلا تغيير؛ والقيمة تستبدله.)</div>`;
+        for (const s of d.secrets) {
+          html += `<div class="row" style="gap:8px;align-items:center;padding:4px 0">
+            <code style="min-width:210px;font-size:12px">${esc(s.key)}</code>
+            <input id="${setInputId(s.key)}" type="password" placeholder="${s.set ? 'Set; leave empty to keep unchanged (مضبوط؛ اتركه فارغًا للإبقاء عليه)' : 'Not set (غير مضبوط)'}"
+                   style="min-height:0;padding:4px 8px;max-width:230px" />
+            <span class="muted" style="font-size:12px;flex:1">${s.set ? '✓ Set (✓ مضبوط)' : '— Not set (— غير مضبوط)'}</span>
+          </div>`;
+          SET_SPECS[s.key] = {key: s.key, type: 'secret'};
+        }
+      }
+      box.innerHTML = html || '<span class="muted">No adjustable settings. (لا توجد إعدادات قابلة للتعديل.)</span>';
+      $('#setHint').textContent = d.env_path ? ('Written to ' + d.env_path + ' (تمت الكتابة إلى ' + d.env_path + ')') : '';
+    } catch (e) {
+      box.innerHTML = `<span class="muted">Read failed: ${esc(e.message)} (فشل القراءة: ${esc(e.message)})</span>`;
+    }
+  }
+
+  function setReadInput(key) {
+    const el = $('#' + setInputId(key));
+    if (!el) return null;
+    if (el.type === 'checkbox') return el.checked ? '1' : '0';
+    return el.value;
+  }
+
+  async function saveSettings() {
+    const values = {};
+    for (const key of Object.keys(SET_SPECS)) {
+      const v = setReadInput(key);
+      if (v === null) continue;
+      if (SET_SPECS[key].type === 'secret') {
+        if (v.trim()) values[key] = v.trim();   // Leave empty values untouched so existing secrets are not erased
+        continue;
+      }
+      if (v !== SET_ORIG[key]) values[key] = v;  // Submit only values that really changed
+    }
+    if (!Object.keys(values).length) { toast('No changes. (لا توجد تغييرات.)'); return; }
+    try {
+      const r = await api('/api/settings', {method: 'POST',
+        body: JSON.stringify({values})});
+      let msg = `Saved ${r.saved} settings. (تم حفظ ${r.saved} إعدادات.)`;
+      if (r.restart_required && r.restart_required.length) {
+        msg += `${r.restart_required.length} require a restart to take effect (${r.restart_required.length} يتطلب إعادة التشغيل): `
+             + r.restart_required.join(', ');
+      } else {
+        msg += 'Effective immediately. (سارية فورًا.)';
+      }
+      toast(msg);
+      loadSettings();
+    } catch (e) { toast('Save failed: ' + e.message + ' (فشل الحفظ: ' + e.message + ')); }
+  }
+
+  async function resetSettings() {
+    if (!await uiConfirm({title:'Restore Default Settings (استعادة الإعدادات الافتراضية)', message:'Restore all settings to defaults? (Secrets will not be changed.) (استعادة جميع الإعدادات إلى الافتراضية؟ لن تتغير الأسرار.)', danger:true})) return;
+    try {
+      const r = await api('/api/settings/reset', {method: 'POST',
+        body: JSON.stringify({})});
+      toast(`Restored ${r.reset} settings to defaults. (تمت استعادة ${r.reset} إعدادات إلى الافتراضية.)`
+        + (r.restart_required && r.restart_required.length
+           ? `${r.restart_required.length} require a restart. (يتطلب ${r.restart_required.length} إعادة تشغيل.)` : ''));
+      loadSettings();
+    } catch (e) { toast('Restore failed: ' + e.message + ' (فشل الاستعادة: ' + e.message + ')); }
+  }
+  </script>
+  </div>
+  <div class="card restore" id="restoreBar">
+    <b>Hidden controls: (العناصر المخفية:)</b>
+    <span class="row fit" id="restoreList"><span class="muted">None (لا شيء)</span></span>
+    <span class="sp" style="flex:1"></span>
+    <span class="muted" id="bpTip" style="font-size:12px"></span>
+    <button class="sm fit" onclick="exportLayout()" title="Export as a JSON file for import on another computer/browser (صدّر كملف JSON للاستيراد على جهاز أو متصفح آخر)">Export Layout (تصدير التخطيط)</button>
+    <button class="sm fit" onclick="importLayout()">Import Layout (استيراد التخطيط)</button>
+    <button class="sm fit" onclick="compactNow()" title="Tighten all controls upward to remove gaps (اضغط كل العناصر إلى الأعلى لإزالة الفجوات)">Compact Layout (ترتيب سريع)</button>
+    <button class="sm fit" onclick="resetSizes()">Reset Control Sizes (إعادة ضبط أحجام العناصر)</button>
+    <button class="sm fit" onclick="resetLayout()">Restore All Defaults (استعادة كل الافتراضيات)</button>
+    <input type="file" id="layFile" accept="application/json,.json" style="display:none" />
+  </div>
+</main>
+
+
+<!-- Help documentation -->
+<div class="modal help" id="mHelp">
+  <h3>User Help · Feature Guide (مساعدة المستخدم · دليل الميزات)</h3>
+  <div class="body">
+    <div class="help-wrap">
+      <nav class="help-nav">
+        <a href="#h-overview" onclick="return helpJump(this)" class="on">Overview (نظرة عامة)</a>
+        <a href="#h-start" onclick="return helpJump(this)">Quick Start (بدء سريع)</a>
+        <a href="#h-accounts" onclick="return helpJump(this)">Account Management (إدارة الحسابات)</a>
+        <a href="#h-import" onclick="return helpJump(this)">Import (استيراد)</a>
+        <a href="#h-export" onclick="return helpJump(this)">Export (تصدير)</a>
+        <a href="#h-regen" onclick="return helpJump(this)">Regenerate Session (إعادة إنشاء الجلسة)</a>
+        <a href="#h-qrlogin" onclick="return helpJump(this)">QR Login (تسجيل الدخول عبر QR)</a>
+        <a href="#h-autologin" onclick="return helpJump(this)">Auto Login (تسجيل الدخول تلقائيًا)</a>
+        <a href="#h-kick" onclick="return helpJump(this)">Clear Devices (مسح الأجهزة) / OKPay</a>
+        <a href="#h-tasks" onclick="return helpJump(this)">Tasks & Leads (المهام والعملاء المحتملون)</a>
+        <a href="#h-2fa" onclick="return helpJump(this)">2FA & Reset (التحقق بخطوتين وإعادة الضبط)</a>
+        <a href="#h-tools" onclick="return helpJump(this)">Toolbox (صندوق الأدوات)</a>
+        <a href="#h-zip" onclick="return helpJump(this)">ZIP Tools (أدوات ZIP)</a>
+        <a href="#h-system" onclick="return helpJump(this)">Hot Reload & Logs (إعادة التحميل والسجلات)</a>
+        <a href="#h-ai" onclick="return helpJump(this)">AI Assistant (مساعد الذكاء الاصطناعي)</a>
+        <a href="#h-settings" onclick="return helpJump(this)">Settings & Layout (الإعدادات والتخطيط)</a>
+        <a href="#h-bot" onclick="return helpJump(this)">Web & Bot (الويب والروبوت)</a>
+        <a href="#h-security" onclick="return helpJump(this)">Security Notes (ملاحظات الأمان)</a>
+      </nav>
+      <div class="help-main">
+        <h4 id="h-overview">Overview (نظرة عامة)</h4>
+        <p>This is a <strong>self-hosted</strong> Telegram multi-account manager: sessions are encrypted in local SQLite and can be operated through the <strong>web</strong> or a <strong>bot</strong>. It is suited for bulk imports, health checks, device cleanup, broadcasts, lead collection, and ZIP pack tools. (هذا مدير حسابات تيليجرام متعدد مستضاف ذاتيًا: تُشفّر الجلسات في SQLite المحلي ويمكن تشغيله عبر الويب أو روبوت. وهو مناسب للاستيراد الجماعي وفحص الحالة وتنظيف الأجهزة والإرسال الجماعي وجمع العملاء وأدوات حزم ZIP.)</p>
+        <div class="tip">Top right, Access Token: enter <code>TAM_WEB_TOKEN</code> here when configured; leave it empty for local tokenless mode. The top bar also has <strong>Health Check</strong>, <strong>Hot Reload</strong>, and <strong>Error Log</strong>. (في أعلى اليمين، رمز الوصول: أدخل TAM_WEB_TOKEN عند ضبطه؛ اتركه فارغًا للوضع المحلي بلا رمز. ويحتوي الشريط العلوي أيضًا على فحص الحالة وإعادة التحميل السريع وسجل الأخطاء.)</div>
+
+        <h4 id="h-start">Quick Start (بدء سريع)</h4>
+        <ul>
+          <li>Double-click <code>start.bat</code> (Windows) or run <code>./start.sh</code>, then choose local/server and web/bot/both. (انقر مرتين على start.bat في Windows أو شغّل ./start.sh ثم اختر محلي/خادم وويب/روبوت/كلاهما.)</li>
+          <li>The Windows “cannot verify publisher” message is for an unsigned script; click <strong>Run</strong>, or first run <code>unblock.bat</code> / choose “Unblock” in Properties. (رسالة Windows «تعذر التحقق من الناشر» تخص برنامجًا نصيًا غير موقّع؛ انقر تشغيل، أو شغّل unblock.bat أولًا / اختر «إلغاء الحظر» من الخصائص.)</li>
+          <li>Open the displayed address in your browser (the local default is <code>http://127.0.0.1:8848</code>). (افتح العنوان الظاهر في المتصفح؛ الافتراضي المحلي هو http://127.0.0.1:8848.)</li>
+          <li>Click “Health Check” first, then import accounts. (انقر «فحص الحالة» أولًا ثم استورد الحسابات.)</li>
+        </ul>
+
+        <h4 id="h-accounts">Account Management (إدارة الحسابات)</h4>
+        <ul>
+          <li><strong>Add Account</strong>: alias, phone number, proxy, tags, code-source link, and more. (إضافة حساب: الاسم المستعار ورقم الهاتف والوكيل والوسوم ورابط مصدر الرمز وغير ذلك.)</li>
+          <li><strong>Select + bulk bar</strong>: health check, auto login, send messages, warm up, proxy check, OKPay balance, kick devices, tag, export, regenerate session, delete, and more. (التحديد + شريط الإجراءات الجماعية: فحص الحالة وتسجيل الدخول التلقائي وإرسال الرسائل وتهيئة الحساب وفحص الوكيل ورصيد OKPay وطرد الأجهزة ووضع الوسوم والتصدير وإعادة إنشاء الجلسة والحذف وغير ذلك.)</li>
+          <li><strong>Open a row</strong>: profile, health check, restriction check, devices/sessions, login, clear devices, export, regenerate, 2FA status/reset, logout, and delete. (افتح صفًا: الملف الشخصي وفحص الحالة وفحص القيود والأجهزة/الجلسات وتسجيل الدخول ومسح الأجهزة والتصدير وإعادة الإنشاء وحالة/إعادة ضبط التحقق بخطوتين وتسجيل الخروج والحذف.)</li>
+          <li>Status: active is normal, restricted is limited, banned is blocked, and unauthorized is not logged in/invalid. (الحالة: active طبيعي، وrestricted مقيّد، وbanned محظور، وunauthorized غير مسجل الدخول/غير صالح.)</li>
+          <li>Bulk operations show <strong>real progress</strong> (completed/success/failed/current account); see the Settings Panel for concurrency and timeouts. (تُظهر العمليات الجماعية تقدمًا حقيقيًا (المكتمل/الناجح/الفاشل/الحساب الحالي)؛ راجع لوحة الإعدادات للتوازي والمهلات.)</li>
+        </ul>
+
+        <h4 id="h-import">Import (استيراد)</h4>
+        <table>
+          <tr><th>Entry (المدخل)</th><th>Description (الوصف)</th></tr>
+          <tr><td>Bulk Import (استيراد جماعي)</td><td>One <code>手机号|取码链接</code> per line; dry-run is available. (رقم الهاتف|رابط الرمز في كل سطر؛ يتوفر التشغيل التجريبي.)</td></tr>
+          <tr><td>session Session Import (استيراد session)</td><td>Upload <code>.session</code> / zip, use a server path, or paste StringSession text. (ارفع .session / zip أو استخدم مسار الخادم أو ألصق نص StringSession.)</td></tr>
+          <tr><td>tdata Import (استيراد tdata)</td><td>Upload a zip containing tdata or enter a path; <strong>built-in parser, no opentele required</strong>. (ارفع zip يحتوي على tdata أو أدخل مسارًا؛ محلل مدمج ولا حاجة إلى opentele.)</td></tr>
+        </table>
+        <div class="tip">Imports use streaming NDJSON progress; the dialog shows the current index/total instead of a frozen fake progress bar. The same <code>user_id</code> is merged into the existing record. (يستخدم الاستيراد تقدم NDJSON متدفقًا؛ تعرض النافذة الرقم الحالي/الإجمالي بدل شريط تقدم وهمي متجمد. ويُدمج user_id نفسه في السجل الموجود.)</div>
+
+        <h4 id="h-export">Export (تصدير)</h4>
+        <ul>
+          <li><strong>StringSession</strong> / <strong>.session</strong> / <strong>pack zip</strong> (session+json). (StringSession / .session / حزمة zip (session+json).)</li>
+          <li><strong>tdata</strong>: real Desktop directory structure (the server must have <code>opentele</code> installed). If missing, the dialog offers <strong>one-click installation</strong>. (tdata: بنية مجلد Desktop حقيقية (يجب تثبيت opentele على الخادم). عند غيابه توفر النافذة تثبيتًا بنقرة واحدة.)</li>
+        </ul>
+        <p>Export only converts sessions already in the library; it does not create new authorizations. Credentials grant login access—never disclose them. (يحوّل التصدير الجلسات الموجودة في المكتبة فقط ولا ينشئ تفويضات جديدة. بيانات الاعتماد تعادل صلاحية الدخول—لا تفصح عنها.)</p>
+
+        <h4 id="h-regen">Regenerate Session (web anti-recovery) (إعادة إنشاء الجلسة (منع الاسترداد عبر الويب))</h4>
+        <p>Like the bot’s “anti-recovery”: log in again with a new device fingerprint, attempt to revoke the old session, replace the library session, and reset the takeover time. (مثل «منع الاسترداد» في الروبوت: تسجيل الدخول ببصمة جهاز جديدة ومحاولة إلغاء الجلسة القديمة واستبدال جلسة المكتبة وإعادة ضبط وقت الاستلام.)</p>
+        <ul>
+          <li>A phone number is required; if 2FA is enabled, enter its password (a password saved in this tool is used automatically; bulk operations can use one shared password). (رقم الهاتف مطلوب؛ إذا كان التحقق بخطوتين مفعّلًا فأدخل كلمة مروره (تُستخدم تلقائيًا كلمة محفوظة في هذه الأداة؛ ويمكن للعمليات الجماعية استخدام كلمة موحدة).)</li>
+          <li>Export after success; tdata is not generated automatically during regeneration. (صدّر بعد النجاح؛ لا يتم إنشاء tdata تلقائيًا أثناء إعادة الإنشاء.)</li>
+          <li><strong>Rate limiting:</strong> several regenerations or incorrect 2FA attempts in a short time may make Telegram return <code>PhonePasswordFlood</code> (too many logins). Wait several hours to 24 hours; do not repeatedly click regenerate. (تحديد المعدل: قد تعيد تيليجرام PhonePasswordFlood بعد عمليات إعادة إنشاء أو محاولات 2FA خاطئة كثيرة خلال وقت قصير (عمليات دخول كثيرة). انتظر من عدة ساعات إلى 24 ساعة ولا تنقر إعادة الإنشاء مرارًا.)</li>
+        </ul>
+
+        <h4 id="h-qrlogin">QR Login (تسجيل الدخول عبر QR)</h4>
+        <p>In account details, click “QR Login”: the web page shows a QR code; scan it with the official Telegram app already signed in on your phone to authorize, and the session is encrypted into the library. No SMS code is needed; if a cloud password is enabled, enter it once after scanning. (في تفاصيل الحساب انقر «تسجيل الدخول عبر QR»: تعرض الصفحة رمز QR؛ امسحه بتطبيق تيليجرام الرسمي المسجل على هاتفك للتفويض، وتُخزّن الجلسة مشفرة في المكتبة. لا يلزم رمز SMS؛ وإذا كانت كلمة المرور السحابية مفعّلة فأدخلها مرة بعد المسح.)</p>
+        <ul>
+          <li>Useful for accounts without a code-source link or for quickly taking over an account already on a phone. (مفيد للحسابات بلا رابط مصدر رمز أو للاستلام السريع لحساب موجود على هاتف.)</li>
+          <li>QR codes expire after about 30 seconds and the page will prompt a refresh; do not start multiple requests to avoid rate limits. (تنتهي رموز QR بعد نحو 30 ثانية وستطلب الصفحة تحديثها؛ لا تبدأ طلبات متعددة لتجنب تحديد المعدل.)</li>
+        </ul>
+
+        <h4 id="h-autologin">Auto Login (تسجيل الدخول تلقائيًا)</h4>
+        <p>This depends on the account’s <strong>code-source link</strong>. Without one, log in manually, use QR Login, or import session/tdata directly. (يعتمد ذلك على رابط مصدر الرمز في الحساب. عند غيابه سجّل الدخول يدويًا أو عبر QR أو استورد session/tdata مباشرة.)</p>
+
+        <h4 id="h-kick">Clear Devices (مسح الأجهزة) / OKPay</h4>
+        <ul>
+          <li>Automatic device cleanup starts from the “local takeover time”; details let you set participation, interval, and looping. (يبدأ تنظيف الأجهزة التلقائي من «وقت الاستلام المحلي»؛ ويمكن من التفاصيل ضبط المشاركة والفترة والتكرار.)</li>
+          <li>Kicking other devices verifies that cleanup succeeded; failures are retried after the configured interval. (يتحقق طرد الأجهزة الأخرى من نجاح التنظيف؛ وتُعاد محاولة الفشل بعد الفترة المضبوطة.)</li>
+          <li>OKPay OKPay balance: query signed-in accounts (requires the corresponding business configuration). (رصيد OKPay: استعلم عن الحسابات المسجل دخولها (يتطلب إعداد الخدمة المعني).)</li>
+        </ul>
+
+        <h4 id="h-tasks">Tasks & Leads (المهام والعملاء المحتملون)</h4>
+        <p>Broadcasts and recent-speaker collection run through the Task Center; you can view progress and stop them. Filter the Lead Library before using it for broadcasts. (تعمل عمليات الإرسال الجماعي وجمع أحدث المتحدثين عبر مركز المهام؛ ويمكنك عرض التقدم وإيقافها. صفِّ مكتبة العملاء قبل استخدامها للإرسال الجماعي.)</p>
+
+        <h4 id="h-2fa">2FA & Reset (التحقق بخطوتين وإعادة الضبط)</h4>
+        <ul>
+          <li><strong>Change 2FA</strong>: available in the Toolbox / Details; you may save the new password encrypted in the library. (تغيير التحقق بخطوتين: متاح في صندوق الأدوات/التفاصيل؛ ويمكنك حفظ كلمة المرور الجديدة مشفرة في المكتبة.)</li>
+          <li><strong>2FA Status</strong>: whether 2FA is enabled, <strong>whether a recovery email is linked</strong>, and whether a reset wait is active. (حالة التحقق بخطوتين: هل هو مفعّل، وهل يوجد بريد استرداد مرتبط، وهل توجد فترة انتظار لإعادة الضبط.)</li>
+          <li><strong>Start 2FA Reset</strong>: follows the official flow and usually waits about 7 days; the cloud password expires afterward. With a recovery email, the previous owner may still recover access by email—check the status first. (بدء إعادة ضبط 2FA: يتبع الإجراء الرسمي وعادة ينتظر نحو 7 أيام؛ وتنتهي كلمة المرور السحابية بعد ذلك. مع بريد استرداد قد يتمكن المالك السابق من الاسترداد عبر البريد—تحقق من الحالة أولًا.)</li>
+          <li><strong>Cancel 2FA Reset</strong>: cancel an active wait. (إلغاء إعادة ضبط 2FA: إلغاء فترة انتظار نشطة.)</li>
+          <li>Supports single-account and multi-select bulk operations. (يدعم الحساب الواحد والعمليات الجماعية متعددة التحديد.)</li>
+        </ul>
+
+        <h4 id="h-tools">Toolbox (صندوق الأدوات)</h4>
+        <p>Run in bulk on <strong>selected library accounts</strong>: activity check, restriction check, privacy, filtering, 2FA changes, 2FA status/reset, contact/session cleanup, anti-recovery cleanup, <strong>block/unblock users</strong>, public-group search, joining groups, member lists, reading group messages, kicking devices, and more. Dangerous items require confirmation. (نفّذ جماعيًا على حسابات المكتبة المحددة: فحص النشاط والقيود والخصوصية والتصفية وتغيير 2FA وحالة/إعادة ضبط 2FA وتنظيف جهات الاتصال/الجلسات والتنظيف المضاد للاسترداد وحظر/إلغاء حظر المستخدمين والبحث عن المجموعات العامة والانضمام إليها وقوائم الأعضاء وقراءة رسائل المجموعة وطرد الأجهزة وغير ذلك. تتطلب العناصر الخطرة تأكيدًا.)</p>
+
+        <h4 id="h-zip">ZIP Tools (does not touch library accounts) (أدوات ZIP (لا تمس حسابات المكتبة))</h4>
+        <ul>
+          <li><strong>Split / merge / classify by registration time / convert to API</strong>: aligned with the bot’s pack capabilities. (التقسيم / الدمج / التصنيف حسب وقت التسجيل / التحويل إلى API: متوافق مع إمكانات الحزم في الروبوت.)</li>
+          <li><strong>Format conversion</strong>: Session→Tdata (requires opentele) or Tdata→Session (built-in parser). (تحويل الصيغ: من Session إلى Tdata (يتطلب opentele) أو من Tdata إلى Session (محلل مدمج).)</li>
+          <li><strong>Passkey</strong>: upload a session pack, initialize Passkey registration, and download a credential zip (creation direction). (Passkey: ارفع حزمة session وابدأ تسجيل Passkey ونزّل zip لبيانات الاعتماد (اتجاه الإنشاء).)</li>
+        </ul>
+        <p>Download results, then click “Delete When Done”. Pack tools are ported from GAFBot (MIT); see <code>NOTICE.GAFBot</code>. (نزّل النتائج ثم انقر «الحذف بعد الاستخدام». أدوات الحزم منقولة من GAFBot (MIT)؛ راجع NOTICE.GAFBot.)</p>
+
+        <h4 id="h-system">Hot Reload & Error Logs (إعادة التحميل السريع وسجلات الأخطاء)</h4>
+        <ul>
+          <li><strong>Hot Reload</strong>: actually restarts the backend process (<code>os.execv</code>); it is not a page refresh. Active tasks are interrupted; the frontend detects recovery after about 1–3 seconds. (إعادة التحميل السريع: تعيد تشغيل عملية الخادم فعليًا (os.execv) وليست تحديثًا للصفحة. تُقاطع المهام النشطة؛ ويكتشف الواجهة التعافي بعد نحو 1–3 ثوانٍ.)</li>
+          <li><strong>Error Log</strong>: records uncaught server exceptions, HTTP 5xx errors, and frontend script errors. View the list, export JSON for reporting, or clear it. (سجل الأخطاء: يسجل استثناءات الخادم غير الملتقطة وأخطاء HTTP 5xx وأخطاء نصوص الواجهة. اعرض القائمة أو صدّر JSON للإبلاغ أو امسحها.)</li>
+          <li>File copy: <code>errors.log</code> in the data directory (it can retain evidence even when the DB fails). (نسخة ملف: errors.log في مجلد البيانات (قد تحتفظ بالأثر حتى عند فشل قاعدة البيانات).)</li>
+        </ul>
+
+        <h4 id="h-settings">Settings & Layout (الإعدادات والتخطيط)</h4>
+        <ul>
+          <li><code>TAM_BATCH_CONCURRENCY</code>: bulk concurrency (1–32). (TAM_BATCH_CONCURRENCY: التوازي الجماعي (1–32).)</li>
+          <li><code>TAM_REGEN_CONCURRENCY</code>: regeneration concurrency (1–8). (TAM_REGEN_CONCURRENCY: توازي إعادة الإنشاء (1–8).)</li>
+          <li><code>TAM_UI_OP_TIMEOUT</code>: per-account timeout in seconds; timeouts are skipped to avoid hangs. (TAM_UI_OP_TIMEOUT: مهلة الحساب الواحد بالثواني؛ تُتخطى المهلة لتجنب التجمّد.)</li>
+          <li>Edit Layout: drag the board; layout JSON can be exported/imported. (تحرير التخطيط: اسحب اللوحة؛ يمكن تصدير/استيراد JSON للتخطيط.)</li>
+        </ul>
+
+        <h4 id="h-bot">Web & Bot (الويب والروبوت)</h4>
+        <p>With <code>TAM_FRONTEND=both</code>, one process runs the web and bot, sharing <code>.env</code> and the data directory, but <strong>the account library is used only by the web/API</strong>. The bot handles temporary pack ZIPs by default and does not automatically write to the managed table. Pack features such as Passkey/format conversion are available in both; device kicking, login, and the Task Center are governed by the web UI. (عند استخدام TAM_FRONTEND=both يشغّل نفس process الويب والروبوت ويشاركان .env ومجلد البيانات، لكن مكتبة الحسابات يستخدمها الويب/API فقط. يعالج الروبوت حزم ZIP المؤقتة افتراضيًا ولا يكتب تلقائيًا في جدول الإدارة. تتوفر ميزات الحزم مثل Passkey وتحويل الصيغ في كليهما؛ ويُعتمد الويب لطرد الأجهزة وتسجيل الدخول ومركز المهام.)</p>
+
+        <h4 id="h-ai">AI Assistant (مساعد الذكاء الاصطناعي)</h4>
+        <p>Click ✦ at the bottom right or “AI Assistant” in the top bar to open the panel. Configure an upstream (OpenAI-compatible / Claude / Gemini / Azure) and key, check <strong>Enable AI Assistant</strong>, and click “Save Configuration” for it to take effect; disabling it also requires saving. Choose permissions with a preset (read-only/safe/standard/full) via “Apply Preset to Selected”, or <strong>select tools individually</strong>. New tools added after an upgrade receive default switches from the current preset. The standard preset excludes account deletion/logout; only the full preset includes them. Login and session import/export are never exposed to AI. (انقر ✦ أسفل اليمين أو «مساعد الذكاء الاصطناعي» في الشريط العلوي لفتح اللوحة. اضبط upstream (متوافق مع OpenAI / Claude / Gemini / Azure) والمفتاح، وحدد تفعيل مساعد الذكاء الاصطناعي ثم انقر «حفظ الإعدادات» ليصبح فعالًا؛ ويتطلب تعطيله الحفظ أيضًا. اختر الصلاحيات بإعداد مسبق (للقراءة فقط/آمن/قياسي/كامل) عبر «تطبيق الإعداد المسبق على المحدد»، أو حدد الأدوات واحدةً واحدة. تحصل الأدوات الجديدة بعد التحديث على مفاتيح افتراضية من الإعداد الحالي. لا يتضمن الإعداد القياسي حذف الحساب/تسجيل الخروج؛ يتضمنها الكامل فقط. لا يُفتح تسجيل الدخول واستيراد/تصدير session للذكاء الاصطناعي.)</p>
+
+        <h4 id="h-security">Security Notes (ملاحظات الأمان)</h4>
+        <ul>
+          <li>The master key encrypts sessions; back up <code>.env</code> / the master key because losing it prevents decrypting old sessions. (يشفر المفتاح الرئيسي الجلسات؛ انسخ .env / المفتاح الرئيسي احتياطيًا لأن فقدانه يمنع فك تشفير الجلسات القديمة.)</li>
+          <li>Exports, regenerated sessions, and API conversion artifacts are equivalent to login credentials; do not share them publicly. (التصديرات والجلسات المعاد إنشاؤها ونواتج التحويل إلى API تعادل بيانات الدخول؛ لا تنشرها.)</li>
+          <li>Use a strong token on servers and HTTPS is recommended; the default is local 127.0.0.1. (استخدم رمزًا قويًا على الخوادم ويُنصح بـ HTTPS؛ الافتراضي هو 127.0.0.1 المحلي.)</li>
+          <li>Read-only/Agent tokens cannot perform write operations such as import or login; hot reload is disabled in read-only mode. (لا تستطيع رموز القراءة فقط/Agent تنفيذ عمليات الكتابة مثل الاستيراد أو تسجيل الدخول؛ وتعطّل إعادة التحميل السريع في وضع القراءة فقط.)</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+  <div class="foot">
+    <button class="primary" onclick="closeAll()">Close (إغلاق)</button>
+  </div>
+</div>
+
+
+<!-- Generic confirmation / input / progress (replaces browser prompt/confirm) -->
+<div class="modal" id="mUi">
+  <h3 id="uiTitle" style="padding:16px 16px 0;margin:0">Notice (تنبيه)</h3>
+  <div class="ui-body">
+    <p class="ui-msg" id="uiMsg"></p>
+    <div id="uiInputWrap" style="display:none">
+      <label class="f"><span id="uiInputLabel">Input (إدخال)</span>
+        <input id="uiInput" autocomplete="off" /></label>
+    </div>
+    <div id="uiProgWrap" class="ui-prog" style="display:none">
+      <div class="bar"><i id="uiProgBar"></i></div>
+      <div class="ui-prog-text" id="uiProgText">—</div>
+    </div>
+  </div>
+  <div class="ui-actions" id="uiActions">
+    <button type="button" id="uiCancel" onclick="uiResolve(false)">Cancel (إلغاء)</button>
+    <button type="button" class="primary" id="uiOk" onclick="uiResolve(true)">Confirm (تأكيد)</button>
+  </div>
+</div>
+
+
+<button type="button" class="ai-fab write" id="aiFab" title="AI Assistant (draggable) (مساعد الذكاء الاصطناعي (قابل للسحب))">✦</button>
+<div class="ai-panel" id="aiPanel" aria-hidden="true">
+  <div class="ai-resize" id="aiResize" title="Drag to resize width (اسحب لتغيير العرض)"></div>
+  <header>
+    <h2>AI Assistant (مساعد الذكاء الاصطناعي)</h2>
+    <span class="pill" id="aiStatus">Disabled (غير مفعّل)</span>
+    <span class="sp"></span>
+    <button class="sm fit" onclick="aiClearHistory()" title="Clear current chat and local history (امسح المحادثة الحالية والسجل المحلي)">Clear Chat (مسح المحادثة)</button>
+    <button class="sm fit" onclick="closeAiPanel()">Close (إغلاق)</button>
+  </header>
+  <div class="ai-tabs">
+    <button type="button" class="on" id="aiTabChat" onclick="aiShowTab('chat')">Chat (محادثة)</button>
+    <button type="button" id="aiTabCfg" onclick="aiShowTab('cfg')">Configuration & Permissions (الإعدادات والصلاحيات)</button>
+  </div>
+  <div class="ai-body">
+    <div class="ai-pane on" id="aiPaneChat">
+      <div class="ai-msgs" id="aiMsgs">
+        <div class="ai-row sys"><div class="ai-bubble sys">Choose the upstream format, enter the endpoint and key, set permissions, and enable it under “Configuration & Permissions”. Markdown tables and code blocks are supported. (اختر صيغة upstream وأدخل الواجهة والمفتاح واضبط الصلاحيات ثم فعّله من «الإعدادات والصلاحيات». يدعم عرض جداول Markdown وكتل التعليمات البرمجية.)</div></div>
+      </div>
+      <div class="ai-compose">
+        <textarea id="aiInput" placeholder="Enter a question, for example: list all active accounts (أدخل سؤالًا، مثلًا: اعرض كل الحسابات النشطة)" rows="2"></textarea>
+        <button class="primary write" id="aiSendBtn" onclick="aiSend()">Send (إرسال)</button>
+      </div>
+    </div>
+    <div class="ai-pane" id="aiPaneCfg">
+      <div class="ai-cfg" id="aiCfgForm">Loading… (جارٍ التحميل…)</div>
+    </div>
+  </div>
+</div>
+
+<div class="backdrop" id="bd" onclick="closeAll()"></div>
+
+<!-- Details drawer -->
+<aside class="drawer" id="drawer">
+  <header><h1 id="dTitle">Account Details (تفاصيل الحساب)</h1><span class="sp"></span><button class="sm fit" onclick="closeAll()">Close (إغلاق)</button></header>
+  <div class="body" id="dBody"></div>
+</aside>
+
+<!-- Add account -->
+<div class="modal" id="mAdd">
+  <h3>Add (إضافة)Account (حساب)</h3>
+  <div class="body">
+    <label class="f"><span>Alias (الاسم المستعار)</span><input id="aLabel" placeholder="Main account (الحساب الرئيسي)" /></label>
+    <label class="f"><span>Phone Number (رقم الهاتف)</span><input id="aPhone" placeholder="+8613800138000" /></label>
+    <label class="f"><span>Code-source link (optional) (رابط مصدر الرمز (اختياري))</span><input id="aCode" placeholder="https://tgapi.example.com/@user/uuid/GetHTML" /></label>
+    <div class="row" style="gap:8px;margin:-6px 0 12px;align-items:center">
+      <button type="button" class="sm fit" id="aCodeTest" onclick="testCodeSource('aCode','aProxy','aCodeStatus')">Test Code Link (اختبار رابط الرمز)</button>
+      <span class="muted" id="aCodeStatus">Read-only test; does not send a Telegram verification code (اختبار للقراءة فقط؛ لا يرسل رمز تحقق تيليجرام)</span>
+    </div>
+    <label class="f"><span>Proxy (optional; one proxy per account is strongly recommended) (الوكيل (اختياري؛ يُنصح بشدة بوكيل لكل حساب))</span><input id="aProxy" placeholder="socks5://user:pass@host:1080" /></label>
+    <label class="f"><span>Tags (comma-separated) (الوسوم (مفصولة بفواصل))</span><input id="aTags" placeholder="batch1,us" /></label>
+  </div>
+  <div class="foot"><button onclick="closeAll()">Cancel (إلغاء)</button><button class="primary" onclick="addAccount()">Add (إضافة)</button></div>
+</div>
+
+
+<!-- Error log -->
+<div class="modal" id="mErrors">
+  <h3>Error Log (سجل الأخطاء)</h3>
+  <div class="body">
+    <p class="muted">Records uncaught server exceptions, HTTP 5xx errors, and frontend reports. Export JSON to send to the maintainer. (يسجل استثناءات الخادم غير الملتقطة وأخطاء HTTP 5xx وتقارير الواجهة. صدّر JSON لإرساله إلى المشرف.)</p>
+    <div class="row" style="gap:8px;margin-bottom:8px;flex-wrap:wrap">
+      <button class="sm" onclick="loadErrorLog()">Refresh (تحديث)</button>
+      <button class="sm write" onclick="exportErrorLog()">Export Report (تصدير التقرير)</button>
+      <button class="sm danger write" onclick="clearErrorLog()">Clear (مسح)</button>
+      <span class="muted" id="errStats">—</span>
+    </div>
+    <pre id="errList" style="max-height:50vh;min-height:180px">加载中…</pre>
+  </div>
+  <div class="foot"><button onclick="closeAll()">Close (إغلاق)</button></div>
+</div>
+
+<!-- Bulk import -->
+<div class="modal" id="mImport">
+  <h3>Bulk Import · phone|code link (الاستيراد الجماعي · الهاتف|رابط الرمز)</h3>
+  <div class="body">
+    <label class="f"><span>Supports phone|code link, Markdown tables, index columns, and backticks; the third field is used as the alias (يدعم الهاتف|رابط الرمز وجداول Markdown وأعمدة الترقيم والـ backticks؛ ويُستخدم الحقل الثالث اسمًا مستعارًا)</span>
+      <textarea id="iText" oninput="previewImport()" placeholder="+10000000000|https://example.invalid/code/primary/GetHTML"></textarea></label>
+    <div class="row">
+      <label class="f" style="flex:1 1 180px"><span>Tags (الوسوم)</span><input id="iTags" placeholder="batch1" /></label>
+      <label class="f" style="flex:1 1 220px"><span>Shared proxy (optional) (وكيل موحد (اختياري))</span><input id="iProxy" placeholder="socks5://host:1080" /></label>
+    </div>
+    <div class="muted" id="iPrev">Parse preview: waiting for input (معاينة التحليل: بانتظار الإدخال)</div>
+    <div class="row" style="gap:8px;margin-top:10px;align-items:center">
+      <button type="button" class="sm fit" id="iCodeTest" onclick="testFirstImportedCodeSource()">Test First Code Link (اختبار أول رابط رمز)</button>
+      <span class="muted" id="iCodeStatus">Read-only test; does not send a Telegram verification code (اختبار للقراءة فقط؛ لا يرسل رمز تحقق تيليجرام)</span>
+    </div>
+  </div>
+  <div class="foot"><button onclick="closeAll()">Cancel (إلغاء)</button>
+    <button onclick="doImport(true)">Dry Run (تشغيل تجريبي)</button>
+    <button class="primary" onclick="doImport(false)">Import (استيراد)</button></div>
+</div>
+
+<!-- tdata import -->
+<div class="modal" id="mTdata">
+  <h3>Import from Telegram Desktop tdata (استيراد من tdata في Telegram Desktop)</h3>
+  <div class="body">
+    <p class="muted">Parsing is done by the built-in pure Python parser; <strong>opentele is not required</strong> and TDesktop 6.x is supported. For upload, zip the entire <code>tdata</code> folder. (يتم التحليل بواسطة محلل Python المدمج؛ لا يلزم opentele وهو متوافق مع TDesktop 6.x. للرفع اضغط مجلد tdata كاملًا في zip.)</p>
+    <div class="row" style="gap:12px;margin-bottom:8px;flex-wrap:wrap">
+      <label class="row muted" style="gap:6px"><input type="radio" name="tdataMode" value="upload" checked onchange="toggleTdataMode()" style="width:16px;min-height:0" /> Upload zip (رفع zip)</label>
+      <label class="row muted" style="gap:6px"><input type="radio" name="tdataMode" value="path" onchange="toggleTdataMode()" style="width:16px;min-height:0" /> Server Path (مسار الخادم)</label>
+    </div>
+    <div id="tdataUploadBox">
+      <label class="f"><span>Select zip files containing tdata (multiple allowed) (اختر ملفات zip التي تحتوي على tdata (يسمح بتعدد الاختيار))</span>
+        <input type="file" id="tUpload" multiple accept=".zip,application/zip" /></label>
+      <div class="muted" id="tUploadHint">No files selected yet (لم يتم اختيار ملفات بعد)</div>
+    </div>
+    <div id="tdataPathBox" style="display:none">
+      <label class="f"><span>Server local path (tdata directory or pack parent directory) (المسار المحلي للخادم (مجلد tdata أو المجلد الأب للحزمة))</span>
+        <input id="tPath" placeholder="/home/me/tdata or /path/to/pack-parent-directory (أو /path/to/مجلد-أب-الحزمة)" /></label>
+      <label class="row muted" style="gap:6px"><input type="checkbox" id="tScan" style="width:16px;min-height:0" /> Recursively scan subdirectories for multiple tdata folders (فحص مجلدات tdata متعددة في المجلدات الفرعية بشكل تكراري)</label>
+    </div>
+    <div class="row">
+      <label class="f" style="flex:1 1 180px"><span>Alias (applies to a single directory) (الاسم المستعار (يُطبق على مجلد واحد))</span><input id="tLabel" /></label>
+      <label class="f" style="flex:1 1 180px"><span>Local passcode (if any) (رمز المرور المحلي (إن وجد))</span><input id="tPass" type="password" /></label>
+    </div>
+    <div class="row">
+      <label class="f" style="flex:1 1 180px"><span>Tags (الوسوم)</span><input id="tTags" placeholder="tdata" /></label>
+      <label class="f" style="flex:1 1 220px"><span>Proxy (الوكيل)</span><input id="tProxy" placeholder="socks5://host:1080" /></label>
+    </div>
+    <label class="row muted" style="gap:6px"><input type="checkbox" id="tDebug" style="width:16px;min-height:0" checked /> Debug mode: output step-by-step diagnostics (enabled automatically when import fails) (وضع التصحيح: إخراج تشخيص خطوة بخطوة (يُفعّل تلقائيًا عند فشل الاستيراد))</label>
+  </div>
+  <div class="foot"><button onclick="closeAll()">Cancel (إلغاء)</button><button onclick="doTdataInspect()">Check First, Do Not Import (فحص أولًا دون استيراد)</button><button class="primary" onclick="doTdata()">Import (استيراد)</button></div>
+</div>
+
+
+<!-- session file / StringSession import -->
+<div class="modal" id="mSession">
+  <h3>Import (استيراد) session</h3>
+  <div class="body">
+    <p class="muted">Three methods: <strong>upload</strong> .session / zip from this device, enter a <strong>server path</strong>, or paste <strong>StringSession</strong> text. Imports are verified online and encrypted into the library. (ثلاث طرق: ارفع .session / zip من هذا الجهاز، أو أدخل مسار الخادم، أو ألصق نص StringSession. يتم التحقق من الاستيراد عبر الشبكة وتخزينه مشفرًا في المكتبة.)</p>
+    <div class="row" style="gap:12px;margin-bottom:10px;flex-wrap:wrap">
+      <label class="row muted" style="gap:6px"><input type="radio" name="sessMode" value="upload" checked onchange="toggleSessMode()" style="width:16px;min-height:0" /> Upload Files (رفع الملفات)</label>
+      <label class="row muted" style="gap:6px"><input type="radio" name="sessMode" value="file" onchange="toggleSessMode()" style="width:16px;min-height:0" /> Server Path (مسار الخادم)</label>
+      <label class="row muted" style="gap:6px"><input type="radio" name="sessMode" value="text" onchange="toggleSessMode()" style="width:16px;min-height:0" /> StringSession Text (نص StringSession)</label>
+    </div>
+    <div id="sessUploadBox">
+      <label class="f"><span>Select .session files or a zip containing multiple sessions (multiple allowed) (اختر ملفات .session أو zip يحتوي على جلسات متعددة (يسمح بتعدد الاختيار))</span>
+        <input type="file" id="sfUpload" multiple accept=".session,.zip,application/zip" /></label>
+      <div class="muted" id="sfUploadHint">No files selected yet (لم يتم اختيار ملفات بعد)</div>
+    </div>
+    <div id="sessFileBox" style="display:none">
+      <label class="f"><span>Server local path (file or directory) (المسار المحلي للخادم (ملف أو مجلد))</span><input id="sfPath" placeholder="/home/me/sessions or /path/to/acc.session (مسار جلسات الخادم أو مسار ملف الحساب)" /></label>
+      <label class="row muted" style="gap:6px"><input type="checkbox" id="sfScan" checked style="width:16px;min-height:0" /> Recursively scan subdirectories when it is a directory (فحص المجلدات الفرعية تكراريًا عند كونه مجلدًا)</label>
+    </div>
+    <div id="sessTextBox" style="display:none">
+      <label class="f"><span>One StringSession per line; you may use <code>别名|session</code> (StringSession واحد في كل سطر؛ يمكنك استخدام alias|session)</span>
+        <textarea id="sfText" placeholder="1BVtsOK4Bu...&#10;main|1AAQ...&#10;# Comment lines are ignored (يتم تجاهل أسطر التعليقات)"></textarea></label>
+    </div>
+    <div class="row">
+      <label class="f" style="flex:1 1 160px"><span>Common alias prefix (optional) (بادئة اسم مستعار موحدة (اختياري))</span><input id="sfLabel" placeholder="session" /></label>
+      <label class="f" style="flex:1 1 160px"><span>Tags (الوسوم)</span><input id="sfTags" placeholder="session,batch" /></label>
+      <label class="f" style="flex:1 1 200px"><span>Shared proxy (optional) (وكيل موحد (اختياري))</span><input id="sfProxy" placeholder="socks5://host:1080" /></label>
+    </div>
+  </div>
+  <div class="foot"><button onclick="closeAll()">Cancel (إلغاء)</button><button class="primary" onclick="doSessionImport()">Import (استيراد)</button></div>
+</div>
+
+<!-- Login -->
+<div class="modal" id="mLogin">
+  <h3>Log In to Account (تسجيل الدخول إلى الحساب) <span class="muted" id="lWho"></span></h3>
+  <div class="body">
+    <p class="muted" id="lHint">No verification code sent yet. Choose manual code sending or automatic code login. (لم يُرسل رمز تحقق بعد. اختر إرسال الرمز يدويًا أو تسجيل الدخول بالرمز تلقائيًا.)</p>
+    <label class="f"><span>Verification Code (رمز التحقق)</span><input id="lCode" inputmode="numeric" placeholder="5 digits (5 أرقام)" /></label>
+    <label class="f"><span>Two-step verification password (if any) (كلمة مرور التحقق بخطوتين (إن وجدت))</span><input id="lPass" type="password" /></label>
+  </div>
+  <div class="foot"><button onclick="closeAll()">Cancel (إلغاء)</button>
+    <button id="lSendBtn" onclick="resend()">Send Code (إرسال الرمز)</button>
+    <button id="lAutoBtn" class="write" onclick="autoLoginFromModal()">Auto Code Login (تسجيل الدخول بالرمز تلقائيًا)</button>
+    <button class="primary" onclick="verify()">Confirm Login (تأكيد تسجيل الدخول)</button></div>
+</div>
+
+
+<!-- QR login -->
+<div class="modal" id="mQrLogin">
+  <h3>QR Login (تسجيل الدخول عبر QR)</h3>
+  <div class="body">
+    <p class="muted" id="qrWho" style="margin:0 0 8px"></p>
+    <p class="muted" style="margin:0 0 10px;font-size:12.5px;line-height:1.5">
+      On your phone, open <strong>Telegram</strong>: Settings → Devices → <strong>Scan QR Code</strong>, or scan this page’s QR code with the system camera. (على هاتفك افتح تيليجرام: الإعدادات ← الأجهزة ← مسح رمز QR، أو امسح رمز QR في هذه الصفحة بكاميرا النظام.)
+      After authorization, this tool receives a new session (encrypted into the library). The QR code is valid for about 30 seconds and refreshes automatically when it expires. (بعد التفويض تحصل الأداة على جلسة جديدة (تُخزّن مشفرة في المكتبة). يسري رمز QR نحو 30 ثانية ويتحدث تلقائيًا عند انتهاء صلاحيته.)
+    </p>
+    <div style="text-align:center;margin:12px 0">
+      <img id="qrImg" alt="QR" style="width:220px;height:220px;background:#fff;border-radius:8px;border:1px solid var(--border)" />
+    </div>
+    <p class="muted" id="qrStatus" style="text-align:center;font-size:13px">Preparing… (جارٍ التحضير…)</p>
+    <label class="f" id="qrPassWrap" style="display:none;margin-top:10px">
+      <span>Two-step verification password (كلمة مرور التحقق بخطوتين)</span>
+      <input id="qrPass" type="password" placeholder="Enter it if a cloud password is requested after scanning (أدخلها إذا طُلبت كلمة مرور سحابية بعد المسح)" />
+    </label>
+  </div>
+  <div class="row" style="justify-content:flex-end;gap:8px;padding:0 16px 14px">
+    <button class="sm fit" type="button" onclick="qrLoginCancel()">Cancel (إلغاء)</button>
+    <button class="sm write" type="button" onclick="qrLoginRefresh()">Refresh QR Code (تحديث رمز QR)</button>
+    <button class="primary write" type="button" id="qrSubmitPass" style="display:none" onclick="qrLoginSubmitPass()">Submit Password (إرسال كلمة المرور)</button>
+  </div>
+</div>
+
+<!-- Send message -->
+<div class="modal" id="mSend">
+  <h3>Send Message (إرسال رسالة)</h3>
+  <div class="body">
+    <label class="f"><span>Recipient (@username / phone / chat id) (المستلم (@اسم المستخدم / الهاتف / chat id))</span><input id="sPeer" placeholder="@someone" /></label>
+    <label class="f"><span>Content (supports variant syntax {hello|there}) (المحتوى (يدعم صيغة البدائل {hello|there}))</span><textarea id="sText" style="min-height:110px;font-family:inherit;font-size:14px" oninput="spinPreview()"></textarea></label>
+    <div class="row" style="gap:8px;align-items:center">
+      <label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="sSpin" checked style="width:16px;min-height:0" /> Enable Variants (تفعيل البدائل)</label>
+      <label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="sHealthy" checked style="width:16px;min-height:0" /> Healthy Accounts Only (الحسابات السليمة فقط)</label>
+      <span class="sp" style="flex:1"></span>
+      <span class="muted" id="spinN">Variants: 1 (البدائل: 1)</span>
+    </div>
+    <pre id="spinPrev" class="muted" style="white-space:pre-wrap;margin:8px 0 0"></pre>
+    <p class="muted">Bulk sending runs serially with random intervals. Do not send spam; accounts can be banned easily. (يعمل الإرسال الجماعي بالتتابع مع فواصل عشوائية. لا ترسل إزعاجًا جماعيًا؛ فقد تُحظر الحسابات بسهولة.)</p>
+  </div>
+  <div class="foot"><button onclick="closeAll()">Cancel (إلغاء)</button><button class="primary" onclick="doSend()">Send (إرسال)</button></div>
+</div>
+
+<div class="modal" id="mChats">
+  <h3>Collect Recent Speakers · Select Groups (جمع أحدث المتحدثين · اختيار المجموعات)</h3>
+  <div class="body">
+    <div class="row" style="gap:8px;align-items:flex-end;flex-wrap:wrap">
+      <label class="f" style="flex:1;min-width:180px"><span>Which account should load groups (أي حساب سيحمّل المجموعات)</span>
+        <select id="cAcc" onchange="loadChats()"></select></label>
+      <label class="f" style="width:130px"><span>Type (النوع)</span>
+        <select id="cKind" onchange="loadChats()">
+          <option value="group">Group (مجموعة)</option>
+          <option value="channel">Channel (قناة)</option>
+          <option value="all">All (الكل)</option>
+        </select></label>
+      <button class="fit" onclick="loadChats(true)">Reload (إعادة التحميل)</button>
+    </div>
+    <div class="row" style="gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px">
+      <input id="cSearch" placeholder="Search group name / @username (ابحث باسم المجموعة / @اسم المستخدم)" oninput="renderChats()" style="flex:1;min-width:160px" />
+      <label style="display:flex;gap:6px;align-items:center" class="muted">
+        <input type="checkbox" id="cActive" checked style="width:16px;min-height:0" onchange="renderChats()" /> Only show groups with new messages in the last 7 days (عرض المجموعات ذات الرسائل الجديدة خلال آخر 7 أيام فقط)</label>
+      <button class="sm fit" onclick="pickChats(true)">Select All (تحديد الكل)</button>
+      <button class="sm fit" onclick="pickChats(false)">Clear (مسح)</button>
+    </div>
+    <div id="chatList" class="chatbox"><span class="muted">Loading groups… (جارٍ تحميل المجموعات…)</span></div>
+    <div class="row" style="gap:8px;flex-wrap:wrap;margin-top:10px">
+      <label class="f" style="width:150px"><span>Speakers from the last how many days (المتحدثون خلال كم يومًا أخيرًا)</span>
+        <input id="cDays" type="number" value="7" min="1" max="90" /></label>
+      <label class="f" style="width:150px"><span>Maximum people per group (الحد الأقصى للأشخاص لكل مجموعة)</span>
+        <input id="cLimit" type="number" value="300" min="10" max="2000" /></label>
+      <label class="f" style="width:150px"><span>Maximum messages to scan per group (الحد الأقصى للرسائل المفحوصة لكل مجموعة)</span>
+        <input id="cScan" type="number" value="3000" min="200" max="20000" /></label>
+      <label class="f" style="flex:1;min-width:160px"><span>Tag this batch of leads (optional, comma-separated) (ضع وسمًا لهذه المجموعة من العملاء (اختياري، مفصول بفواصل))</span>
+        <input id="cTags" placeholder="Example: highly active,crypto (مثال: نشط جدًا،عملات مشفرة)" /></label>
+    </div>
+    <div class="row" style="gap:12px;align-items:center;margin-top:8px">
+      <label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="cSkipBot" checked style="width:16px;min-height:0" /> Skip bots (تخطي الروبوتات)</label>
+      <label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="cSkipPrem" style="width:16px;min-height:0" /> Skip Premium users (تخطي مستخدمي Premium)</label>
+      <label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="cCapture" style="width:16px;min-height:0" onchange="$('#cTextLimit').disabled = !this.checked" /> Also save conversation history (حفظ سجل المحادثات أيضًا)</label>
+      <label class="f"><span>Maximum saved messages per group (الحد الأقصى للرسائل المحفوظة لكل مجموعة)</span>
+        <input id="cTextLimit" type="number" value="4000" min="100" max="50000" disabled /></label>
+      <span class="sp" style="flex:1"></span>
+      <span class="muted" id="cCount">Selected: 0 groups (المحدد: 0 مجموعة)</span>
+    </div>
+    <p class="muted">Collection reads historical messages only and leaves no trace in groups; larger groups take longer, so try a small scope first. (يقرأ الجمع الرسائل التاريخية فقط ولا يترك أثرًا في المجموعات؛ تستغرق المجموعات الأكبر وقتًا أطول، لذا جرّب نطاقًا صغيرًا أولًا.)</p>
+  </div>
+  <div class="foot"><button onclick="closeAll()">Cancel (إلغاء)</button>
+    <button class="primary" onclick="startCollect()">Start Collection (بدء الجمع)</button></div>
+</div>
+
+<div class="toasts" id="toasts"></div>
+
+<script>
+/* JS_PLACEHOLDER */
+</script>
+</body>
+</html>
